@@ -22,6 +22,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -112,6 +113,100 @@ def short_build_temp_dir() -> Path:
     return Path(drive + "\\_g2t_build_tmp")
 
 
+def find_vcvarsall() -> str:
+    """MSVC 빌드 도구(vcvarsall.bat) 경로를 vswhere로 찾는다.
+
+    llama-cpp-python은 Windows에서 미리 빌드된 wheel이 없어서 항상 소스를 C/C++로 컴파일해야
+    하는데, 이때 CMake가 쓰는 nmake/cl.exe는 Visual Studio(또는 Build Tools)를 설치해도 기본
+    PATH에는 없다 - "Developer Command Prompt"를 통해서만 잡힌다. vswhere.exe는 VS2017 이후
+    아무 Visual Studio 제품(Build Tools만 설치해도 포함)에나 같이 깔리는 표준 검색 도구라
+    이걸로 C++ 빌드 도구가 설치된 VS를 찾는다.
+    """
+    program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    vswhere = Path(program_files_x86) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    if not vswhere.exists():
+        return ""
+    try:
+        result = subprocess.run(
+            [
+                str(vswhere), "-latest", "-products", "*",
+                "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                "-property", "installationPath",
+            ],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    install_path = result.stdout.strip()
+    if not install_path:
+        return ""
+    vcvarsall = Path(install_path) / "VC" / "Auxiliary" / "Build" / "vcvarsall.bat"
+    return str(vcvarsall) if vcvarsall.exists() else ""
+
+
+def msvc_build_env(base_env: dict) -> dict | None:
+    """vcvarsall.bat x64를 실행해 얻은 PATH/INCLUDE/LIB 등을 base_env에 합쳐 반환한다.
+
+    nmake/cl.exe가 이미 PATH에 있다면(개발자 명령 프롬프트에서 직접 실행한 경우 등) 그대로
+    base_env를 반환한다. vcvarsall.bat도 못 찾으면 None을 반환한다 - 이 경우 소스 빌드 자체가
+    불가능하므로 호출하는 쪽에서 설치 안내 메시지를 띄우고 중단해야 한다.
+    """
+    if shutil.which("nmake", path=base_env.get("PATH")) and shutil.which("cl", path=base_env.get("PATH")):
+        return base_env
+
+    vcvarsall = find_vcvarsall()
+    if not vcvarsall:
+        return None
+
+    # cmd.exe /c "<string with embedded quotes>"를 argv 리스트로 넘기면 subprocess의 자동
+    # 인용부호 처리와 cmd.exe의 파싱 규칙이 서로 안 맞아(중첩된 큰따옴표가 리터럴 백슬래시로
+    # 깨짐) vcvarsall.bat이 아예 실행되지 않는 문제가 있었다. 임시 .bat 파일을 만들어
+    # 그 안에서 호출하면 이런 중첩 인용 문제 자체가 생기지 않는다.
+    marker = "___G2T_VCVARS_DONE___"
+    fd, bat_path = tempfile.mkstemp(suffix=".bat")
+    os.close(fd)
+    try:
+        Path(bat_path).write_text(
+            f'@echo off\r\ncall "{vcvarsall}" x64\r\nif errorlevel 1 exit /b 1\r\necho {marker}\r\nset\r\n',
+            encoding="mbcs",
+        )
+        try:
+            result = subprocess.run([bat_path], capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            return None
+    finally:
+        Path(bat_path).unlink(missing_ok=True)
+
+    if marker not in result.stdout:
+        return None
+
+    env = base_env.copy()
+    for line in result.stdout.split(marker, 1)[1].splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key:
+            env[key] = value
+    return env
+
+
+def long_paths_enabled() -> bool:
+    """Windows의 긴 경로(LongPathsEnabled) 지원 여부를 레지스트리에서 확인한다.
+
+    최신 llama-cpp-python 소스에는 웹 UI(vendor/llama.cpp/tools/ui/src/lib/components/...)의
+    깊게 중첩된 컴포넌트 트리가 같이 들어있어서, TEMP를 아무리 짧게 잡아도(_g2t_build_tmp)
+    전체 경로가 Windows 기본 260자 제한을 넘어 pip 압축 해제가 실패하는 경우가 있다.
+    이 레지스트리 값이 꺼져 있으면(기본값) 짧은 TEMP로도 해결이 안 되므로 빌드 전에 미리
+    확인해서, 매번 똑같이 실패할 다운로드+빌드를 두 번(GPU/CPU) 반복하지 않는다.
+    """
+    import winreg
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\FileSystem") as key:
+            value, _ = winreg.QueryValueEx(key, "LongPathsEnabled")
+            return bool(value)
+    except OSError:
+        return False
+
+
 def ensure_venv() -> None:
     if venv_python().exists():
         log(f"venv_chat이 이미 있습니다: {VENV_DIR}")
@@ -127,17 +222,47 @@ def install_llama_cpp_python() -> str:
     py = str(venv_python())
     run([py, "-m", "pip", "install", "-q", "-U", "pip"], check=False)
 
+    # llama-cpp-python은 Windows용 사전빌드 wheel이 없어 pip이 항상 소스를 C/C++로 컴파일한다.
+    # MSVC 빌드 도구(nmake/cl.exe)가 없으면 CUDA 여부와 무관하게 무조건 실패하므로, 빌드를
+    # 두 번(GPU/CPU) 시도해서 매번 같은 CMake 에러를 보여주기 전에 여기서 먼저 확인한다.
+    build_env = msvc_build_env(os.environ.copy())
+    if build_env is None:
+        log("MSVC C++ 빌드 도구(nmake/cl.exe)를 찾지 못했습니다.")
+        log("llama-cpp-python은 Windows용 사전빌드 wheel이 없어 반드시 로컬에서 컴파일해야 합니다.")
+        log(
+            "Visual Studio Build Tools를 설치한 뒤 다시 실행해주세요 "
+            "(https://visualstudio.microsoft.com/downloads/ 에서 'Build Tools for Visual Studio' 다운로드, "
+            "설치 화면에서 'C++를 사용한 데스크톱 개발' 워크로드를 선택)."
+        )
+        raise RuntimeError("MSVC 빌드 도구(Visual Studio Build Tools)가 설치되어 있지 않습니다.")
+
+    if not long_paths_enabled():
+        log("Windows 긴 경로(Long Path) 지원이 꺼져 있습니다 (기본값).")
+        log(
+            "llama-cpp-python 소스에 포함된 웹 UI 컴포넌트 경로가 매우 깊어서, 이 설정이 꺼져 있으면 "
+            "TEMP 폴더를 아무리 짧게 잡아도 Windows의 260자 경로 제한에 걸려 빌드가 실패합니다."
+        )
+        log("관리자 권한 PowerShell에서 아래 명령을 한 번 실행한 뒤 setup_chat.bat을 다시 실행해주세요:")
+        log(
+            '  New-ItemProperty -Path "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\FileSystem" '
+            '-Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force'
+        )
+        raise RuntimeError("Windows 긴 경로 지원이 꺼져 있어 llama-cpp-python 빌드가 불가능합니다.")
+
+    # 긴 경로 지원이 켜져 있어도 짧은 TEMP를 같이 쓰면 더 안전하므로(그룹 정책 등으로 레지스트리
+    # 값과 실제 동작이 어긋나는 예외적 환경 대비) GPU/CPU 두 시도 모두에 적용한다.
+    short_tmp = short_build_temp_dir()
+    short_tmp.mkdir(exist_ok=True)
+    build_env["TEMP"] = str(short_tmp)
+    build_env["TMP"] = str(short_tmp)
+
     cuda_path = find_cuda_path()
     if cuda_path:
         log(f"CUDA 툴킷 발견({cuda_path}). GPU 가속 빌드를 시도합니다...")
-        env = os.environ.copy()
+        env = build_env.copy()
         env["CUDA_PATH"] = cuda_path
         env["PATH"] = str(Path(cuda_path) / "bin") + os.pathsep + env.get("PATH", "")
         env["CMAKE_ARGS"] = "-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=native"
-        short_tmp = short_build_temp_dir()
-        short_tmp.mkdir(exist_ok=True)
-        env["TEMP"] = str(short_tmp)
-        env["TMP"] = str(short_tmp)
 
         result = run(
             [py, "-m", "pip", "install", "llama-cpp-python", "--no-cache-dir"],
@@ -149,7 +274,7 @@ def install_llama_cpp_python() -> str:
     else:
         log("CUDA 툴킷을 찾지 못했습니다. CPU 전용으로 설치합니다 (느리지만 항상 동작함)...")
 
-    result = run([py, "-m", "pip", "install", "llama-cpp-python", "--no-cache-dir"])
+    result = run([py, "-m", "pip", "install", "llama-cpp-python", "--no-cache-dir"], env=build_env)
     if result.returncode != 0:
         raise RuntimeError("llama-cpp-python 설치에 실패했습니다. 수동으로 확인이 필요합니다.")
     return "gguf-cpu"
