@@ -11,6 +11,7 @@ stdin에서 JSON을 한 줄씩 요청으로 받아 stdout으로 토큰을 스트
 치명적 오류(모델 로딩 실패 등): {"type": "fatal_error", "message": "..."}
 """
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -53,6 +54,22 @@ def load_backend():
         model_path = CHAT_BACKEND_DIR / "models" / model_path
     if not model_path.exists():
         raise RuntimeError(f"모델 파일을 찾을 수 없습니다: {model_path} (setup_chat.bat을 먼저 실행하세요)")
+
+    if backend == "gguf-cuda":
+        # llama-cpp-python은 빌드 시점의 CUDA 버전에 맞는 런타임 DLL(cudart64_*.dll 등)을
+        # 이 프로세스 안에서 찾아야 한다. 이 PC에 다른 CUDA 버전에 의존하는 별도 프로젝트가
+        # 있을 수 있으므로, 시스템 전역 CUDA_PATH/PATH는 건드리지 않고 이 프로세스 안에서만
+        # os.add_dll_directory로 DLL 검색 경로를 추가한다 - 다른 프로그램에 영향이 없다.
+        # 경로/버전은 절대 하드코딩하지 않고 매번 find_cuda_path()로 새로 찾는다(설치된
+        # CUDA 버전이 바뀌거나 다른 PC로 옮겨도 그대로 동작하도록).
+        from cuda_discovery import find_cuda_path
+
+        cuda_path = find_cuda_path()
+        if cuda_path:
+            os.environ["CUDA_PATH"] = cuda_path
+            cuda_bin = os.path.join(cuda_path, "bin")
+            if hasattr(os, "add_dll_directory") and os.path.isdir(cuda_bin):
+                os.add_dll_directory(cuda_bin)
 
     from llama_cpp import Llama
 

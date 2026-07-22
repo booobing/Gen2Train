@@ -25,6 +25,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from cuda_discovery import find_cuda_path
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 VENV_DIR = BASE_DIR / "venv_chat"
 CHAT_BACKEND_DIR = BASE_DIR / "chat_backend"
@@ -71,38 +73,6 @@ def find_system_python() -> str:
         return found
     # 3) 마지막 수단: 지금 이 스크립트를 실행 중인 인터프리터
     return sys.executable
-
-
-def find_cuda_path() -> str:
-    """표준 설치 경로에 있는 CUDA 툴킷 중 가장 최신 버전을 찾는다.
-
-    CUDA_PATH 환경변수를 무조건 믿지 않는다 - 여러 버전이 함께 설치된 PC에서는 이 값이
-    오래된 버전을 가리키고 있을 수 있다(실제로 이 개발 PC도 v11.8/v12.8이 같이 설치돼
-    있었는데 CUDA_PATH는 v11.8을 가리켰다). 최신 GPU(Blackwell 등)는 최신 CUDA가 필요하므로
-    디렉터리를 스캔해 실제로 존재하는 버전 중 최신을 우선 고르고, 표준 경로 자체가 없을 때만
-    CUDA_PATH를 마지막 수단으로 쓴다.
-    """
-    def version_key(path: Path) -> tuple:
-        nums = []
-        for part in path.name.lstrip("vV").split("."):
-            try:
-                nums.append(int(part))
-            except ValueError:
-                break
-        return tuple(nums)
-
-    program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
-    cuda_root = Path(program_files) / "NVIDIA GPU Computing Toolkit" / "CUDA"
-    if cuda_root.exists():
-        versions = [p for p in cuda_root.iterdir() if p.is_dir() and p.name.lower().startswith("v")]
-        if versions:
-            return str(max(versions, key=version_key))
-
-    env_cuda = os.environ.get("CUDA_PATH")
-    if env_cuda and Path(env_cuda).exists():
-        return env_cuda
-
-    return ""
 
 
 def short_build_temp_dir() -> Path:
