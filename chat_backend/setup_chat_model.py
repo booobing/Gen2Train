@@ -19,6 +19,7 @@ AWQ 로딩 경로를 추가해야 쓸 수 있다 - 이 스크립트가 자동으
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -35,6 +36,17 @@ BACKEND_CONFIG_PATH = CHAT_BACKEND_DIR / "backend_config.json"
 
 GGUF_REPO = "LGAI-EXAONE/EXAONE-Deep-2.4B-GGUF"
 GGUF_FILENAME = "EXAONE-Deep-2.4B-Q4_K_M.gguf"
+
+# abetlen.github.io가 실제로 게시하는 llama-cpp-python 사전빌드 CUDA wheel 태그
+# (2026-07 확인: cu121/cu122/cu123/cu124/cu118은 존재, cu126/cu128은 404). 정확한 마이너
+# 버전이 없어도 같은 메이저 버전 안에서는 최신 CUDA 드라이버가 예전 마이너 버전용으로 빌드된
+# 바이너리를 대체로 문제없이 실행한다(CUDA의 마이너 버전 순방향 호환성) - 그래서 소스 빌드가
+# 이 PC의 Visual Studio/CUDA 조합과 근본적으로 안 맞아 전부 실패해도(예: 최신 VS가 이
+# CUDA의 컴파일 도구와 바이너리 비호환) 이 목록으로 최신 버전을 유지하며 GPU를 쓸 수 있다.
+KNOWN_PREBUILT_CUDA_TAGS = {
+    12: ["cu124", "cu123", "cu122", "cu121"],
+    11: ["cu118"],
+}
 
 
 def log(msg: str) -> None:
@@ -277,6 +289,36 @@ def _try_gpu_build(py: str, build_env: dict, cuda_path: str, extra_cuda_flags: s
     return result.returncode == 0
 
 
+def _try_prebuilt_cuda_wheel(py: str, cuda_path: str) -> bool:
+    """이 PC의 Visual Studio/CUDA 조합으로는 소스 빌드가 근본적으로 안 될 때(예: 최신 VS의
+    컴파일러가 이 CUDA 버전 내부 도구와 바이너리 비호환) 마지막으로 커뮤니티 사전빌드
+    wheel을 시도한다. CUDA 메이저 버전만 보고 그 안에서 실제 게시된 태그를 최신순으로
+    시도하며, --only-binary로 wheel이 없으면 소스 빌드로 새지 않고 바로 실패하게 한다."""
+    match = re.search(r"v(\d+)\.(\d+)", Path(cuda_path).name)
+    if not match:
+        return False
+    major = int(match.group(1))
+    tags = KNOWN_PREBUILT_CUDA_TAGS.get(major, [])
+    if not tags:
+        return False
+
+    for tag in tags:
+        log(f"커뮤니티 사전빌드 CUDA wheel({tag})을 시도합니다...")
+        result = run(
+            [
+                py, "-m", "pip", "install", "llama-cpp-python",
+                "--extra-index-url", f"https://abetlen.github.io/llama-cpp-python/whl/{tag}",
+                "--prefer-binary", "--only-binary=llama-cpp-python",
+                "--force-reinstall", "--no-cache-dir",
+            ],
+            check=False,
+        )
+        if result.returncode == 0:
+            log(f"사전빌드 wheel({tag}) 설치 성공.")
+            return True
+    return False
+
+
 def install_llama_cpp_python() -> str:
     """CUDA 빌드를 시도하고, 실패하면 CPU 전용으로 폴백한다. 실제 설치된 backend 이름을 반환."""
     py = str(venv_python())
@@ -348,9 +390,17 @@ def install_llama_cpp_python() -> str:
                 log(f"{tag}: 마지막 후보도 실패했습니다.")
 
         log("설치된 모든 Visual Studio 조합으로 GPU 가속 빌드를 시도했지만 전부 실패했습니다.")
-        log("CPU 전용으로 안전하게 설치를 진행합니다 (느리지만 항상 동작함).")
-        log("그래도 GPU가 꼭 필요하면 이 CUDA 버전을 지원하는 llama-cpp-python 사전빌드")
-        log("wheel을 수동으로 설치해보세요 (이 스크립트가 자동으로 처리할 수 없는 조합입니다).")
+
+        # 이 PC의 Visual Studio/CUDA 조합으로는 소스 빌드가 근본적으로 안 되는 경우(진짜
+        # 바이너리 비호환)에도, GPU를 포기하지 않고 커뮤니티가 미리 빌드해둔 wheel로 마지막
+        # 시도를 한다. 최신 버전(0.3.34 등)을 유지하지 못할 수 있지만(그 태그에 그 버전
+        # wheel이 없으면 pip이 자동으로 그 태그에서 구할 수 있는 최신 버전을 고른다), 소스
+        # 컴파일 없이 GPU 가속을 쓸 수 있다.
+        if _try_prebuilt_cuda_wheel(py, cuda_path):
+            return "gguf-cuda"
+
+        log("커뮤니티 사전빌드 wheel도 실패했습니다. CPU 전용으로 안전하게 설치를 진행합니다 "
+            "(느리지만 항상 동작함).")
     else:
         log("CUDA 툴킷을 찾지 못했습니다. CPU 전용으로 설치합니다 (느리지만 항상 동작함)...")
 
