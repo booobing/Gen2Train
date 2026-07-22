@@ -1,3 +1,6 @@
 datasets
 models
 venv_chat
+./datasets
+./models
+./venv_chat
