@@ -86,35 +86,67 @@ def short_build_temp_dir() -> Path:
     return Path(drive + "\\_g")
 
 
-def find_vcvarsall() -> str:
-    """MSVC 빌드 도구(vcvarsall.bat) 경로를 vswhere로 찾는다.
+def find_vs_installations() -> list:
+    """C++ 빌드 도구가 설치된 모든 Visual Studio(Build Tools 포함)를 최신순으로 찾는다.
 
     llama-cpp-python은 Windows에서 미리 빌드된 wheel이 없어서 항상 소스를 C/C++로 컴파일해야
     하는데, 이때 CMake가 쓰는 nmake/cl.exe는 Visual Studio(또는 Build Tools)를 설치해도 기본
     PATH에는 없다 - "Developer Command Prompt"를 통해서만 잡힌다. vswhere.exe는 VS2017 이후
-    아무 Visual Studio 제품(Build Tools만 설치해도 포함)에나 같이 깔리는 표준 검색 도구라
-    이걸로 C++ 빌드 도구가 설치된 VS를 찾는다.
+    아무 Visual Studio 제품(Build Tools만 설치해도 포함)에나 같이 깔리는 표준 검색 도구다.
+
+    최신 VS가 설치된 CUDA 버전이 공식 지원하는 컴파일러 범위보다 너무 새로우면(예: CUDA
+    12.6 + VS 2026 preview) nvcc 내부 도구(cudafe++ 등)가 그 MSVC가 만든 코드를 파싱하다
+    충돌하는, 플래그로도 우회 불가능한 실제 바이너리 비호환이 날 수 있다. 같은 PC에 여러 VS
+    버전이 나란히 설치돼 있으면 전부 후보로 반환해서(최신 우선) 하나씩 재시도할 수 있게 한다.
+    반환값: [(버전 문자열, vcvarsall.bat 경로), ...] - 최신 버전이 먼저 온다.
     """
     program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
     vswhere = Path(program_files_x86) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
     if not vswhere.exists():
-        return ""
+        return []
     try:
         result = subprocess.run(
             [
-                str(vswhere), "-latest", "-products", "*",
+                str(vswhere), "-products", "*",
                 "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-                "-property", "installationPath",
+                "-format", "json",
             ],
             capture_output=True, text=True, timeout=15,
         )
     except (OSError, subprocess.SubprocessError):
-        return ""
-    install_path = result.stdout.strip()
-    if not install_path:
-        return ""
-    vcvarsall = Path(install_path) / "VC" / "Auxiliary" / "Build" / "vcvarsall.bat"
-    return str(vcvarsall) if vcvarsall.exists() else ""
+        return []
+    try:
+        instances = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+
+    def version_key(inst: dict) -> tuple:
+        nums = []
+        for part in str(inst.get("installationVersion", "")).split("."):
+            try:
+                nums.append(int(part))
+            except ValueError:
+                break
+        return tuple(nums)
+
+    instances.sort(key=version_key, reverse=True)
+
+    found = []
+    for inst in instances:
+        install_path = inst.get("installationPath")
+        if not install_path:
+            continue
+        vcvarsall = Path(install_path) / "VC" / "Auxiliary" / "Build" / "vcvarsall.bat"
+        if vcvarsall.exists():
+            found.append((str(inst.get("installationVersion", "?")), str(vcvarsall)))
+    return found
+
+
+def find_vcvarsall() -> str:
+    """가장 최신 Visual Studio의 vcvarsall.bat 경로. (CUDA 호환성 재시도용 여러 후보가
+    필요하면 find_vs_installations()를 쓴다.)"""
+    installations = find_vs_installations()
+    return installations[0][1] if installations else ""
 
 
 def find_ninja() -> str:
@@ -138,19 +170,23 @@ def find_ninja() -> str:
     return ""
 
 
-def msvc_build_env(base_env: dict) -> dict | None:
+def msvc_build_env(base_env: dict, vcvarsall: str = None) -> dict | None:
     """vcvarsall.bat x64를 실행해 얻은 PATH/INCLUDE/LIB 등을 base_env에 합쳐 반환한다.
 
-    nmake/cl.exe가 이미 PATH에 있다면(개발자 명령 프롬프트에서 직접 실행한 경우 등) 그대로
-    base_env를 반환한다. vcvarsall.bat도 못 찾으면 None을 반환한다 - 이 경우 소스 빌드 자체가
-    불가능하므로 호출하는 쪽에서 설치 안내 메시지를 띄우고 중단해야 한다.
+    vcvarsall을 지정하지 않으면: nmake/cl.exe가 이미 PATH에 있으면(개발자 명령 프롬프트에서
+    직접 실행한 경우 등) 그대로 base_env를 반환하고, 없으면 가장 최신 VS를 자동으로 찾는다.
+    (특정 VS 후보를 강제하고 싶으면 - 예: 최신 VS가 CUDA와 호환되지 않아 다른 버전을 재시도할
+    때 - vcvarsall을 명시적으로 넘긴다. 이때는 PATH에 이미 다른 VS의 cl.exe가 잡혀 있을 수
+    있으므로 "이미 있으면 그대로 쓰기" 지름길을 타지 않는다.)
+    vcvarsall.bat을 못 찾으면 None을 반환한다 - 이 경우 소스 빌드 자체가 불가능하므로
+    호출하는 쪽에서 설치 안내 메시지를 띄우고 중단해야 한다.
     """
-    if shutil.which("nmake", path=base_env.get("PATH")) and shutil.which("cl", path=base_env.get("PATH")):
-        return base_env
-
-    vcvarsall = find_vcvarsall()
-    if not vcvarsall:
-        return None
+    if vcvarsall is None:
+        if shutil.which("nmake", path=base_env.get("PATH")) and shutil.which("cl", path=base_env.get("PATH")):
+            return base_env
+        vcvarsall = find_vcvarsall()
+        if not vcvarsall:
+            return None
 
     # cmd.exe /c "<string with embedded quotes>"를 argv 리스트로 넘기면 subprocess의 자동
     # 인용부호 처리와 cmd.exe의 파싱 규칙이 서로 안 맞아(중첩된 큰따옴표가 리터럴 백슬래시로
@@ -211,16 +247,44 @@ def ensure_venv() -> None:
     run([py, "-m", "venv", str(VENV_DIR)], check=True)
 
 
+def _apply_build_tools(env: dict, ninja_path: str) -> dict:
+    """generator(Ninja/NMake) 설정을 env에 적용한다. CMake의 기본 생성기 선택 로직이
+    환경에 따라(특히 최신/프리뷰 Visual Studio가 설치된 경우) "Visual Studio" MSBuild
+    생성기를 고를 수 있는데, 이건 CUDA Toolkit 설치 시 그 정확한 VS 버전용 통합
+    파일(BuildCustomizations)이 같이 등록돼 있어야만 동작한다. CUDA를 나중에 설치했거나
+    VS를 나중에 새로 깔면 이 매칭이 깨져 "No CUDA toolset found"로 실패한다. Ninja나
+    NMake Makefiles로 고정하면 nvcc를 직접 호출해 이 문제 자체가 생기지 않는다. 둘 다 이
+    문제를 피하지만 NMake는 파일을 한 번에 하나씩만 순차 컴파일해 ggml-cuda처럼 무거운
+    .cu 파일이 많은 프로젝트에서는 몹시 느리므로, 있으면 Ninja를 우선한다."""
+    if ninja_path:
+        env["CMAKE_GENERATOR"] = "Ninja"
+        env["CMAKE_MAKE_PROGRAM"] = ninja_path
+        env["PATH"] = str(Path(ninja_path).parent) + os.pathsep + env.get("PATH", "")
+    else:
+        env["CMAKE_GENERATOR"] = "NMake Makefiles"
+    return env
+
+
+def _try_gpu_build(py: str, build_env: dict, cuda_path: str, extra_cuda_flags: str = None) -> bool:
+    env = build_env.copy()
+    env["CUDA_PATH"] = cuda_path
+    env["PATH"] = str(Path(cuda_path) / "bin") + os.pathsep + env.get("PATH", "")
+    cmake_args = "-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=native"
+    if extra_cuda_flags:
+        cmake_args += f" -DCMAKE_CUDA_FLAGS={extra_cuda_flags}"
+    env["CMAKE_ARGS"] = cmake_args
+    result = run([py, "-m", "pip", "install", "llama-cpp-python", "--no-cache-dir"], env=env)
+    return result.returncode == 0
+
+
 def install_llama_cpp_python() -> str:
     """CUDA 빌드를 시도하고, 실패하면 CPU 전용으로 폴백한다. 실제 설치된 backend 이름을 반환."""
     py = str(venv_python())
     run([py, "-m", "pip", "install", "-q", "-U", "pip"], check=False)
 
     # llama-cpp-python은 Windows용 사전빌드 wheel이 없어 pip이 항상 소스를 C/C++로 컴파일한다.
-    # MSVC 빌드 도구(nmake/cl.exe)가 없으면 CUDA 여부와 무관하게 무조건 실패하므로, 빌드를
-    # 두 번(GPU/CPU) 시도해서 매번 같은 CMake 에러를 보여주기 전에 여기서 먼저 확인한다.
-    build_env = msvc_build_env(os.environ.copy())
-    if build_env is None:
+    vs_installations = find_vs_installations()
+    if not vs_installations:
         log("MSVC C++ 빌드 도구(nmake/cl.exe)를 찾지 못했습니다.")
         log("llama-cpp-python은 Windows용 사전빌드 wheel이 없어 반드시 로컬에서 컴파일해야 합니다.")
         log(
@@ -243,67 +307,60 @@ def install_llama_cpp_python() -> str:
             '-Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force'
         )
 
-    # 긴 경로 지원이 켜져 있어도 짧은 TEMP를 같이 쓰면 더 안전하므로(그룹 정책 등으로 레지스트리
-    # 값과 실제 동작이 어긋나는 예외적 환경 대비) GPU/CPU 두 시도 모두에 적용한다.
     short_tmp = short_build_temp_dir()
     short_tmp.mkdir(exist_ok=True)
-    build_env["TEMP"] = str(short_tmp)
-    build_env["TMP"] = str(short_tmp)
-
-    # CMake의 기본 생성기 선택 로직이 환경에 따라(특히 최신/프리뷰 Visual Studio가 설치된
-    # 경우) "Visual Studio" MSBuild 생성기를 고를 수 있는데, 이건 CUDA Toolkit 설치 시
-    # 그 정확한 VS 버전용 통합 파일(BuildCustomizations)이 같이 등록돼 있어야만 동작한다.
-    # CUDA를 나중에 설치했거나 VS를 나중에 새로 깔면 이 매칭이 깨져 "No CUDA toolset found"로
-    # 실패한다. Ninja나 NMake Makefiles로 고정하면 nvcc를 직접 호출해 이 문제 자체가 생기지
-    # 않는다. 둘 다 이 문제를 피하지만 NMake는 파일을 한 번에 하나씩만 순차 컴파일해 ggml-cuda
-    # 처럼 무거운 .cu 파일이 많은 프로젝트에서는 몹시 느리므로, 있으면 Ninja를 우선한다.
     ninja_path = find_ninja()
     if ninja_path:
         log(f"Ninja 빌드 도구 발견({ninja_path}). 병렬 컴파일로 빌드합니다.")
-        build_env["CMAKE_GENERATOR"] = "Ninja"
-        build_env["CMAKE_MAKE_PROGRAM"] = ninja_path
-        build_env["PATH"] = str(Path(ninja_path).parent) + os.pathsep + build_env.get("PATH", "")
     else:
         log("Ninja를 찾지 못해 NMake Makefiles로 빌드합니다 (더 느림, 순차 컴파일).")
-        build_env["CMAKE_GENERATOR"] = "NMake Makefiles"
 
     cuda_path = find_cuda_path()
     if cuda_path:
-        log(f"CUDA 툴킷 발견({cuda_path}). GPU 가속 빌드를 시도합니다...")
-        env = build_env.copy()
-        env["CUDA_PATH"] = cuda_path
-        env["PATH"] = str(Path(cuda_path) / "bin") + os.pathsep + env.get("PATH", "")
-        env["CMAKE_ARGS"] = "-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=native"
+        log(f"CUDA 툴킷 발견({cuda_path}).")
 
-        result = run(
-            [py, "-m", "pip", "install", "llama-cpp-python", "--no-cache-dir"],
-            env=env,
-        )
-        if result.returncode == 0:
-            return "gguf-cuda"
+        # 설치된 Visual Studio가 이 CUDA 버전이 공식 지원하는 컴파일러 범위보다 새로우면
+        # ("unsupported Microsoft Visual Studio version!" 또는 cudafe++ 등 내부 도구가
+        # 실제로 충돌하는 바이너리 비호환) 빌드가 실패할 수 있다. 최신 VS를 먼저 시도하고,
+        # 실패하면 -allow-unsupported-compiler로 한 번 더(단순 버전 체크였다면 이걸로
+        # 풀린다), 그래도 안 되면(진짜 바이너리 비호환) 이 PC에 나란히 설치된 더 오래된
+        # VS 후보로 넘어가며 같은 두 단계를 반복한다.
+        for i, (vs_version, vcvarsall) in enumerate(vs_installations):
+            build_env = msvc_build_env(os.environ.copy(), vcvarsall=vcvarsall)
+            if build_env is None:
+                continue
+            build_env["TEMP"] = str(short_tmp)
+            build_env["TMP"] = str(short_tmp)
+            build_env = _apply_build_tools(build_env, ninja_path)
 
-        # 설치된 Visual Studio가 이 CUDA 버전이 공식 지원하는 컴파일러 범위보다 최신이면
-        # ("unsupported Microsoft Visual Studio version!") nvcc가 컴파일 자체를 거부한다.
-        # CUDA는 이럴 때를 위해 -allow-unsupported-compiler라는 공식 우회 옵션을 제공하므로,
-        # (오래된 버전에 영구히 묶이는 사전빌드 wheel을 받아오는 대신) 최신 소스로 한 번 더
-        # 빌드를 시도한다.
-        log("GPU 가속 빌드 실패. Visual Studio 버전이 이 CUDA가 공식 지원하는 범위보다 최신일 수")
-        log("있어(자주 있는 조합), -allow-unsupported-compiler 옵션으로 한 번 더 시도합니다...")
-        env_unsupported = env.copy()
-        env_unsupported["CMAKE_ARGS"] = (
-            "-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=native "
-            "-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler"
-        )
-        result = run(
-            [py, "-m", "pip", "install", "llama-cpp-python", "--no-cache-dir"],
-            env=env_unsupported,
-        )
-        if result.returncode == 0:
-            return "gguf-cuda"
+            tag = f"Visual Studio {vs_version} ({i + 1}/{len(vs_installations)})"
+            log(f"GPU 가속 빌드 시도 - {tag}...")
+            if _try_gpu_build(py, build_env, cuda_path):
+                return "gguf-cuda"
 
-        log("GPU 가속 빌드가 계속 실패합니다. CPU 전용으로 다시 시도합니다 (느리지만 항상 동작함)...")
+            log(f"{tag}: 기본 빌드 실패. -allow-unsupported-compiler 옵션으로 재시도...")
+            if _try_gpu_build(py, build_env, cuda_path, extra_cuda_flags="-allow-unsupported-compiler"):
+                return "gguf-cuda"
+
+            if i + 1 < len(vs_installations):
+                log(f"{tag}: 계속 실패. 이 PC의 다른 Visual Studio 후보로 재시도합니다...")
+            else:
+                log(f"{tag}: 마지막 후보도 실패했습니다.")
+
+        log("설치된 모든 Visual Studio 조합으로 GPU 가속 빌드를 시도했지만 전부 실패했습니다.")
+        log("CPU 전용으로 안전하게 설치를 진행합니다 (느리지만 항상 동작함).")
+        log("그래도 GPU가 꼭 필요하면 이 CUDA 버전을 지원하는 llama-cpp-python 사전빌드")
+        log("wheel을 수동으로 설치해보세요 (이 스크립트가 자동으로 처리할 수 없는 조합입니다).")
     else:
         log("CUDA 툴킷을 찾지 못했습니다. CPU 전용으로 설치합니다 (느리지만 항상 동작함)...")
+
+    # CPU 폴백: 순수 C 컴파일에도 MSVC 환경은 필요하므로 가장 최신 VS 후보를 그대로 쓴다.
+    build_env = msvc_build_env(os.environ.copy(), vcvarsall=vs_installations[0][1])
+    if build_env is None:
+        raise RuntimeError("MSVC 빌드 환경을 구성하지 못했습니다.")
+    build_env["TEMP"] = str(short_tmp)
+    build_env["TMP"] = str(short_tmp)
+    build_env = _apply_build_tools(build_env, ninja_path)
 
     result = run([py, "-m", "pip", "install", "llama-cpp-python", "--no-cache-dir"], env=build_env)
     if result.returncode != 0:
