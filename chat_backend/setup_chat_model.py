@@ -281,7 +281,27 @@ def install_llama_cpp_python() -> str:
         )
         if result.returncode == 0:
             return "gguf-cuda"
-        log("GPU 가속 빌드 실패. CPU 전용으로 다시 시도합니다 (느리지만 항상 동작함)...")
+
+        # 설치된 Visual Studio가 이 CUDA 버전이 공식 지원하는 컴파일러 범위보다 최신이면
+        # ("unsupported Microsoft Visual Studio version!") nvcc가 컴파일 자체를 거부한다.
+        # CUDA는 이럴 때를 위해 -allow-unsupported-compiler라는 공식 우회 옵션을 제공하므로,
+        # (오래된 버전에 영구히 묶이는 사전빌드 wheel을 받아오는 대신) 최신 소스로 한 번 더
+        # 빌드를 시도한다.
+        log("GPU 가속 빌드 실패. Visual Studio 버전이 이 CUDA가 공식 지원하는 범위보다 최신일 수")
+        log("있어(자주 있는 조합), -allow-unsupported-compiler 옵션으로 한 번 더 시도합니다...")
+        env_unsupported = env.copy()
+        env_unsupported["CMAKE_ARGS"] = (
+            "-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=native "
+            "-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler"
+        )
+        result = run(
+            [py, "-m", "pip", "install", "llama-cpp-python", "--no-cache-dir"],
+            env=env_unsupported,
+        )
+        if result.returncode == 0:
+            return "gguf-cuda"
+
+        log("GPU 가속 빌드가 계속 실패합니다. CPU 전용으로 다시 시도합니다 (느리지만 항상 동작함)...")
     else:
         log("CUDA 툴킷을 찾지 못했습니다. CPU 전용으로 설치합니다 (느리지만 항상 동작함)...")
 
