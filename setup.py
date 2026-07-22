@@ -1,0 +1,163 @@
+"""Gen2Train 메인 앱 설치 스크립트.
+
+torch/accelerate/transformers/diffusers 등 학습에 필요한 패키지와 PySide6/psutil(UI/하트비트용)을
+설치한다. kohya_ss의 공유 venv가 실제로 동작하면 그걸 재사용하고(이미 torch 등이 깔려 있을
+가능성이 높아 다운로드를 아낀다), 없거나 망가져 있으면(예: 다른 PC에서 복사된 venv라
+pyvenv.cfg가 그 PC의 경로를 가리키는 경우) 이 프로젝트 전용 venv(Gen2Train\\venv)를 새로
+만든다. 어떤 PC에서 실행해도 동작하도록 Python/CUDA 위치를 하드코딩하지 않고 그때그때 탐색한다.
+
+사용법: Gen2Train\\setup.bat 을 더블클릭하거나, 이 파일을 아무 python으로나 실행.
+run.bat은 필요한 패키지가 없으면 이 스크립트를 자동으로 실행한다.
+"""
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+VENV_DIR = BASE_DIR / "venv"
+SHARED_VENV_DIR = BASE_DIR.parent / "kohya_ss" / "kohya_ss" / "venv"
+SD_SCRIPTS_REQUIREMENTS = BASE_DIR / "sd-scripts" / "requirements.txt"
+EXTRA_REQUIREMENTS = BASE_DIR / "requirements-extra.txt"
+
+# chat_backend/cuda_discovery.py의 CUDA 탐색 로직을 그대로 재사용한다 - 같은 로직을
+# 여기에 또 하드코딩하지 않는다.
+sys.path.insert(0, str(BASE_DIR / "chat_backend"))
+from cuda_discovery import find_cuda_path  # noqa: E402
+
+# PyTorch 공식 wheel 인덱스가 실제로 게시하는 CUDA 태그(2026-07 확인: cu118/121/124/126/128
+# 전부 존재). 정확한 마이너 버전이 없어도 같은 메이저 버전 안에서는 최신 CUDA 드라이버가
+# 이전 마이너 버전용으로 빌드된 바이너리를 대체로 문제없이 실행한다(CUDA의 마이너 버전
+# 순방향 호환성).
+KNOWN_TORCH_CUDA_TAGS = {
+    12: ["cu128", "cu126", "cu124", "cu121"],
+    11: ["cu118"],
+}
+
+
+def log(msg: str) -> None:
+    print(f"[setup] {msg}", flush=True)
+
+
+def run(cmd, **kwargs) -> subprocess.CompletedProcess:
+    log("실행: " + " ".join(str(c) for c in cmd))
+    return subprocess.run(cmd, **kwargs)
+
+
+def find_system_python() -> str:
+    """venv를 새로 만들 때 쓸 시스템 Python을 찾는다. 특정 사용자/설치 경로를 가정하지 않는다."""
+    for py_args in (["py", "-3.11"], ["py", "-3"]):
+        try:
+            result = subprocess.run(
+                py_args + ["-c", "import sys; print(sys.executable)"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode == 0:
+            path = result.stdout.strip()
+            if path and Path(path).exists():
+                return path
+    found = shutil.which("python") or shutil.which("python3")
+    if found:
+        return found
+    return sys.executable
+
+
+def shared_venv_python() -> str:
+    """kohya_ss 공유 venv의 python.exe 경로. 파일 존재만이 아니라 실제로 동작하는지까지
+    확인한다 - 다른 PC에서 복사된 venv는 pyvenv.cfg가 원래 PC의 경로를 가리켜 깨져 있을
+    수 있다(run.bat과 동일한 이유)."""
+    candidate = SHARED_VENV_DIR / "Scripts" / "python.exe"
+    if not candidate.exists():
+        return ""
+    try:
+        result = subprocess.run(
+            [str(candidate), "-c", "print(1)"], capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return str(candidate) if result.stdout.strip() == "1" else ""
+
+
+def venv_python() -> Path:
+    return VENV_DIR / "Scripts" / "python.exe"
+
+
+def ensure_venv() -> str:
+    shared = shared_venv_python()
+    if shared:
+        log(f"kohya_ss 공유 venv를 재사용합니다: {shared}")
+        return shared
+
+    if venv_python().exists():
+        log(f"기존 venv를 재사용합니다: {VENV_DIR}")
+        return str(venv_python())
+
+    log("kohya_ss 공유 venv가 없거나 동작하지 않아 이 프로젝트 전용 venv를 새로 만듭니다...")
+    py = find_system_python()
+    log(f"시스템 Python 사용: {py}")
+    run([py, "-m", "venv", str(VENV_DIR)], check=True)
+    return str(venv_python())
+
+
+def package_importable(py: str, module: str) -> bool:
+    result = subprocess.run([py, "-c", f"import {module}"], capture_output=True, text=True)
+    return result.returncode == 0
+
+
+def install_torch(py: str) -> None:
+    if package_importable(py, "torch"):
+        log("torch가 이미 설치되어 있습니다.")
+        return
+
+    run([py, "-m", "pip", "install", "-q", "-U", "pip"], check=False)
+
+    cuda_path = find_cuda_path()
+    if cuda_path:
+        match = re.search(r"v(\d+)\.(\d+)", Path(cuda_path).name)
+        major = int(match.group(1)) if match else None
+        tags = KNOWN_TORCH_CUDA_TAGS.get(major, [])
+        for tag in tags:
+            log(f"CUDA 툴킷 발견({cuda_path}). PyTorch({tag}) 설치를 시도합니다...")
+            result = run(
+                [py, "-m", "pip", "install", "torch", "--index-url", f"https://download.pytorch.org/whl/{tag}"],
+                check=False,
+            )
+            if result.returncode == 0:
+                return
+        log("모든 CUDA 태그로 PyTorch GPU 설치를 시도했지만 실패했습니다. CPU 전용으로 설치합니다...")
+    else:
+        log("CUDA 툴킷을 찾지 못했습니다. CPU 전용 PyTorch를 설치합니다 (느리지만 항상 동작함)...")
+
+    run([py, "-m", "pip", "install", "torch"], check=True)
+
+
+def install_requirements(py: str) -> None:
+    if SD_SCRIPTS_REQUIREMENTS.exists():
+        log("학습 관련 패키지(accelerate, transformers, diffusers 등)를 설치합니다...")
+        # sd-scripts/requirements.txt의 마지막 줄("-e .")은 sd-scripts 자신을 editable
+        # 패키지로 설치하라는 kohya_ss의 관례다. pip은 "."을 requirements.txt 파일의
+        # 위치가 아니라 "이 pip 프로세스를 호출한 cwd"를 기준으로 해석하므로, cwd를
+        # 명시적으로 sd-scripts 폴더로 지정하지 않으면 setup.py를 어느 위치에서
+        # 실행했는지에 따라 엉뚱한 곳을 가리켜 실패할 수 있다.
+        run(
+            [py, "-m", "pip", "install", "-r", str(SD_SCRIPTS_REQUIREMENTS)],
+            cwd=str(SD_SCRIPTS_REQUIREMENTS.parent),
+            check=True,
+        )
+    if EXTRA_REQUIREMENTS.exists():
+        log("UI/하트비트 관련 패키지(PySide6, psutil)를 설치합니다...")
+        run([py, "-m", "pip", "install", "-r", str(EXTRA_REQUIREMENTS)], check=True)
+
+
+def main() -> None:
+    py = ensure_venv()
+    install_torch(py)
+    install_requirements(py)
+    log("설치 완료! run.bat으로 Gen2Train을 실행하세요.")
+
+
+if __name__ == "__main__":
+    main()
