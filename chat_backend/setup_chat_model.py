@@ -106,11 +106,14 @@ def find_cuda_path() -> str:
 
 
 def short_build_temp_dir() -> Path:
-    # llama.cpp 소스 트리 안에 워낙 깊은 경로가 있어서, Windows의 260자 경로 제한에
-    # 걸려 압축 해제가 실패할 수 있다. 어떤 드라이브에 이 프로젝트가 있든(꼭 C:가 아니어도)
-    # 그 드라이브 루트에 짧은 임시 폴더를 만들어 우회한다.
+    # llama.cpp 소스 트리 안에는 웹 UI(tools/ui/src/lib/components/...)의 깊게 중첩된 경로가
+    # 있어서 Windows의 260자 경로 제한에 아슬아슬하게(실측 약 261자) 걸려 압축 해제가 실패할
+    # 수 있다. pip이 자기 내부적으로 붙이는 "pip-install-XXXXXXXX\llama-cpp-python_<32자 해시>"
+    # 부분(약 70자)은 줄일 수 없으므로, 우리가 통제할 수 있는 접두 폴더 이름을 최대한
+    # 짧게(2글자) 잡아 여유를 최대한 확보한다. 어떤 드라이브에 이 프로젝트가 있든(꼭 C:가
+    # 아니어도) 그 드라이브 루트에 만든다.
     drive = Path(__file__).resolve().drive or "C:"
-    return Path(drive + "\\_g2t_build_tmp")
+    return Path(drive + "\\_g")
 
 
 def find_vcvarsall() -> str:
@@ -142,6 +145,27 @@ def find_vcvarsall() -> str:
         return ""
     vcvarsall = Path(install_path) / "VC" / "Auxiliary" / "Build" / "vcvarsall.bat"
     return str(vcvarsall) if vcvarsall.exists() else ""
+
+
+def find_ninja() -> str:
+    """Ninja 빌드 도구 경로를 찾는다.
+
+    CMake의 "Visual Studio" MSBuild 생성기는 VS 버전별 CUDA 통합 파일이 필요해 깨지기 쉽고,
+    "NMake Makefiles"는 그 문제는 없지만 컴파일을 한 번에 한 파일씩 순차로만 처리해 ggml-cuda처럼
+    무거운 .cu 파일이 많은 프로젝트에서는 매우 느리다. Ninja는 두 문제 모두 없다 - CUDA 통합
+    파일이 필요 없고, CPU 코어 수만큼 자동으로 병렬 컴파일한다. PATH에 없어도 Visual
+    Studio/Build Tools를 설치하면 거의 항상 같이 번들로 들어있다.
+    """
+    found = shutil.which("ninja")
+    if found:
+        return found
+    vcvarsall = find_vcvarsall()
+    if vcvarsall:
+        vs_root = Path(vcvarsall).parent.parent.parent.parent
+        candidate = vs_root / "Common7" / "IDE" / "CommonExtensions" / "Microsoft" / "CMake" / "Ninja" / "ninja.exe"
+        if candidate.exists():
+            return str(candidate)
+    return ""
 
 
 def msvc_build_env(base_env: dict) -> dict | None:
@@ -237,17 +261,17 @@ def install_llama_cpp_python() -> str:
         raise RuntimeError("MSVC 빌드 도구(Visual Studio Build Tools)가 설치되어 있지 않습니다.")
 
     if not long_paths_enabled():
-        log("Windows 긴 경로(Long Path) 지원이 꺼져 있습니다 (기본값).")
+        # 짧은 TEMP 접두(short_build_temp_dir)로 대부분의 경우는 260자 제한 안에 들어오지만,
+        # 그래도 딱 걸리는 경우를 대비해 미리 안내만 해둔다 - 여기서 바로 중단하지는 않는다.
+        log("참고: Windows 긴 경로(Long Path) 지원이 꺼져 있습니다 (기본값).")
         log(
-            "llama-cpp-python 소스에 포함된 웹 UI 컴포넌트 경로가 매우 깊어서, 이 설정이 꺼져 있으면 "
-            "TEMP 폴더를 아무리 짧게 잡아도 Windows의 260자 경로 제한에 걸려 빌드가 실패합니다."
+            "빌드 중 파일 경로가 너무 길다는 오류(No such file or directory 등)가 나오면, "
+            "관리자 권한 PowerShell에서 아래 명령을 한 번 실행한 뒤 setup_chat.bat을 다시 실행해주세요:"
         )
-        log("관리자 권한 PowerShell에서 아래 명령을 한 번 실행한 뒤 setup_chat.bat을 다시 실행해주세요:")
         log(
             '  New-ItemProperty -Path "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\FileSystem" '
             '-Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force'
         )
-        raise RuntimeError("Windows 긴 경로 지원이 꺼져 있어 llama-cpp-python 빌드가 불가능합니다.")
 
     # 긴 경로 지원이 켜져 있어도 짧은 TEMP를 같이 쓰면 더 안전하므로(그룹 정책 등으로 레지스트리
     # 값과 실제 동작이 어긋나는 예외적 환경 대비) GPU/CPU 두 시도 모두에 적용한다.
@@ -255,6 +279,23 @@ def install_llama_cpp_python() -> str:
     short_tmp.mkdir(exist_ok=True)
     build_env["TEMP"] = str(short_tmp)
     build_env["TMP"] = str(short_tmp)
+
+    # CMake의 기본 생성기 선택 로직이 환경에 따라(특히 최신/프리뷰 Visual Studio가 설치된
+    # 경우) "Visual Studio" MSBuild 생성기를 고를 수 있는데, 이건 CUDA Toolkit 설치 시
+    # 그 정확한 VS 버전용 통합 파일(BuildCustomizations)이 같이 등록돼 있어야만 동작한다.
+    # CUDA를 나중에 설치했거나 VS를 나중에 새로 깔면 이 매칭이 깨져 "No CUDA toolset found"로
+    # 실패한다. Ninja나 NMake Makefiles로 고정하면 nvcc를 직접 호출해 이 문제 자체가 생기지
+    # 않는다. 둘 다 이 문제를 피하지만 NMake는 파일을 한 번에 하나씩만 순차 컴파일해 ggml-cuda
+    # 처럼 무거운 .cu 파일이 많은 프로젝트에서는 몹시 느리므로, 있으면 Ninja를 우선한다.
+    ninja_path = find_ninja()
+    if ninja_path:
+        log(f"Ninja 빌드 도구 발견({ninja_path}). 병렬 컴파일로 빌드합니다.")
+        build_env["CMAKE_GENERATOR"] = "Ninja"
+        build_env["CMAKE_MAKE_PROGRAM"] = ninja_path
+        build_env["PATH"] = str(Path(ninja_path).parent) + os.pathsep + build_env.get("PATH", "")
+    else:
+        log("Ninja를 찾지 못해 NMake Makefiles로 빌드합니다 (더 느림, 순차 컴파일).")
+        build_env["CMAKE_GENERATOR"] = "NMake Makefiles"
 
     cuda_path = find_cuda_path()
     if cuda_path:
@@ -295,7 +336,13 @@ def download_model() -> None:
         "from huggingface_hub import hf_hub_download; "
         f"hf_hub_download(repo_id='{GGUF_REPO}', filename='{GGUF_FILENAME}', local_dir=r'{MODELS_DIR}')"
     )
-    run([py, "-c", download_script], check=True)
+    # huggingface_hub는 hf_xet(네이티브 Rust 바이너리)이 설치돼 있으면 자동으로 그걸 써서
+    # 다운로드를 가속하려 하는데, 회사 PC 등 애플리케이션 제어 정책(WDAC/AppLocker 등)이 걸린
+    # 환경에서는 서명되지 않은 이 DLL 로딩 자체가 차단될 수 있다. 파일이 1.6GB 정도로 크지
+    # 않으니 굳이 가속을 쓰지 않고 항상 기본 HTTPS 다운로드 경로로 통일해 이 문제를 피한다.
+    env = os.environ.copy()
+    env["HF_HUB_DISABLE_XET"] = "1"
+    run([py, "-c", download_script], check=True, env=env)
 
 
 def write_backend_config(backend: str) -> None:
