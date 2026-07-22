@@ -1,6 +1,6 @@
 {
   "backend": "gguf-cuda",
   "model_path": "EXAONE-Deep-2.4B-Q4_K_M.gguf",
-  "n_gpu_layers": -1,
+  "n_gpu_layers": 0,
   "n_ctx": 16384
 }
