@@ -67,6 +67,18 @@ def run(cmd, **kwargs) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, **kwargs)
 
 
+def _can_create_venv(path: str) -> bool:
+    """Debian/Ubuntu는 venv에 필요한 ensurepip을 python3-venv라는 별도 apt 패키지로
+    분리해뒀다 - 있어 보여도 이 모듈이 없으면 "python -m venv"가 한참 뒤에야 실패한다."""
+    try:
+        result = subprocess.run(
+            [path, "-c", "import ensurepip, venv"], capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
 def find_system_python() -> str:
     """venv_chat을 새로 만들 때 쓸 시스템 Python을 찾는다. 특정 사용자/설치 경로를 가정하지 않는다."""
     if IS_WINDOWS:
@@ -86,11 +98,16 @@ def find_system_python() -> str:
                 if path and Path(path).exists():
                     return path
     else:
-        # 1) Linux/WSL2: python3.11을 우선 찾고, 없으면 아무 python3나 찾는다.
+        # 1) Linux/WSL2: python3.11을 우선 찾고, 없으면 아무 python3나 찾는다. venv를 만들 수
+        # 없는 후보(ensurepip 없음)는 건너뛰고 다음 후보로 넘어간다.
         for candidate in ("python3.11", "python3"):
             found = shutil.which(candidate)
-            if found:
+            if not found:
+                continue
+            if _can_create_venv(found):
                 return found
+            log(f"참고: {found}은 있지만 venv를 만들 수 없습니다 (ensurepip 모듈 없음).")
+            log(f"Ubuntu/WSL2라면: sudo apt install -y {Path(found).name}-venv")
     # 2) PATH에 등록된 python
     found = shutil.which("python") or shutil.which("python3")
     if found:
@@ -297,7 +314,12 @@ def _try_gpu_build(py: str, build_env: dict, cuda_path: str, extra_cuda_flags: s
     if extra_cuda_flags:
         cmake_args += f" -DCMAKE_CUDA_FLAGS={extra_cuda_flags}"
     env["CMAKE_ARGS"] = cmake_args
-    result = run([py, "-m", "pip", "install", "llama-cpp-python", "--no-cache-dir"], env=env)
+    # --force-reinstall이 없으면, 이전 시도(예: CUDA 없이 CPU로 설치된 적이 있거나, 다른
+    # VS 후보로 실패한 적이 있는 상태)에서 이미 어떤 버전이든 llama-cpp-python이 깔려 있으면
+    # pip이 "Requirement already satisfied"로 아무것도 안 하고 성공한 것처럼 끝나버린다 -
+    # 그러면 CMAKE_ARGS가 이번엔 제대로 켜져 있어도 실제로는 예전의 CPU 전용 빌드가 그대로
+    # 남아 backend_config.json에는 "gguf-cuda"라고 잘못 기록되는 문제가 생긴다.
+    result = run([py, "-m", "pip", "install", "llama-cpp-python", "--force-reinstall", "--no-cache-dir"], env=env)
     return result.returncode == 0
 
 
@@ -363,7 +385,13 @@ def _install_llama_cpp_python_linux(py: str) -> str:
         env["CUDA_PATH"] = cuda_path
         env["PATH"] = str(Path(cuda_path) / "bin") + os.pathsep + env.get("PATH", "")
         env["CMAKE_ARGS"] = "-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=native"
-        result = run([py, "-m", "pip", "install", "llama-cpp-python", "--no-cache-dir"], env=env, check=False)
+        # --force-reinstall 필수: 없으면 예전에 CPU 전용으로 깔려 있던 llama-cpp-python이
+        # "Requirement already satisfied"로 그대로 남는데도 여기서는 성공(gguf-cuda)으로
+        # 잘못 판단하게 된다 (실제로 이 문제가 재현됨).
+        result = run(
+            [py, "-m", "pip", "install", "llama-cpp-python", "--force-reinstall", "--no-cache-dir"],
+            env=env, check=False,
+        )
         if result.returncode == 0:
             return "gguf-cuda"
         log("GPU 가속 빌드 실패. CPU 전용으로 재시도합니다...")
@@ -376,7 +404,9 @@ def _install_llama_cpp_python_linux(py: str) -> str:
         )
 
     env.pop("CMAKE_ARGS", None)
-    result = run([py, "-m", "pip", "install", "llama-cpp-python", "--no-cache-dir"], env=env)
+    result = run(
+        [py, "-m", "pip", "install", "llama-cpp-python", "--force-reinstall", "--no-cache-dir"], env=env,
+    )
     if result.returncode != 0:
         raise RuntimeError("llama-cpp-python 설치에 실패했습니다. 수동으로 확인이 필요합니다.")
     return "gguf-cpu"
@@ -471,7 +501,9 @@ def _install_llama_cpp_python_windows(py: str) -> str:
     build_env["TMP"] = str(short_tmp)
     build_env = _apply_build_tools(build_env, ninja_path)
 
-    result = run([py, "-m", "pip", "install", "llama-cpp-python", "--no-cache-dir"], env=build_env)
+    result = run(
+        [py, "-m", "pip", "install", "llama-cpp-python", "--force-reinstall", "--no-cache-dir"], env=build_env,
+    )
     if result.returncode != 0:
         raise RuntimeError("llama-cpp-python 설치에 실패했습니다. 수동으로 확인이 필요합니다.")
     return "gguf-cpu"

@@ -75,6 +75,20 @@ def _python_version(path: str) -> tuple | None:
         return None
 
 
+def _can_create_venv(path: str) -> bool:
+    """Debian/Ubuntu는 venv를 만드는 데 필요한 ensurepip을 python3-venv라는 별도 apt
+    패키지로 분리해뒀다 - python3(.X) 자체는 있어도 이 모듈이 없으면 "python -m venv"가
+    한참 뒤에(venv 폴더까지 만든 다음) "ensurepip is not available"로 실패한다. 후보를
+    실제로 쓰기 전에 미리 걸러낸다."""
+    try:
+        result = subprocess.run(
+            [path, "-c", "import ensurepip, venv"], capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
 def find_system_python() -> str:
     """venv를 새로 만들 때 쓸 시스템 Python을 찾는다. 특정 사용자/설치 경로를 가정하지 않는다."""
     if IS_WINDOWS:
@@ -93,13 +107,17 @@ def find_system_python() -> str:
     else:
         for candidate in ("python3.11", "python3.10"):
             found = shutil.which(candidate)
-            if found:
+            if not found:
+                continue
+            if _can_create_venv(found):
                 return found
+            log(f"참고: {found}은 있지만 venv를 만들 수 없습니다 (ensurepip 모듈 없음).")
+            log(f"Ubuntu/WSL2라면: sudo apt install -y {Path(found).name}-venv")
 
-    # 여기까지 왔으면 정확히 3.10/3.11로 이름 붙은 인터프리터를 못 찾은 것이다. PATH의
-    # python3/python으로 그럭저럭 넘어갈 수는 있지만(예: conda base 환경의 python3가 3.14인
-    # 경우), sd-scripts의 오래된 고정 버전 패키지들이 빌드 실패할 가능성이 높으므로 그냥
-    # 조용히 쓰지 않고 미리 경고한다.
+    # 여기까지 왔으면 정확히 3.10/3.11로 이름 붙은, venv를 만들 수 있는 인터프리터를 못 찾은
+    # 것이다. PATH의 python3/python으로 그럭저럭 넘어갈 수는 있지만(예: conda base 환경의
+    # python3가 3.14인 경우), sd-scripts의 오래된 고정 버전 패키지들이 빌드 실패할 가능성이
+    # 높으므로 그냥 조용히 쓰지 않고 미리 경고한다.
     found = shutil.which("python") or shutil.which("python3")
     if found:
         version = _python_version(found)
@@ -118,6 +136,11 @@ def find_system_python() -> str:
                     "&& sudo apt install -y python3.11 python3.11-venv)"
                 )
             log("일단 이 Python으로 계속 진행합니다...")
+        if not IS_WINDOWS and not _can_create_venv(found):
+            py_name = Path(found).name
+            log(f"오류: {found}으로도 venv를 만들 수 없습니다 (ensurepip 모듈 없음).")
+            log(f"Ubuntu/WSL2라면 다음을 실행한 뒤 다시 시도해주세요: sudo apt install -y {py_name}-venv")
+            raise RuntimeError(f"venv를 만들 수 있는 Python을 찾지 못했습니다 ({py_name}-venv 패키지 필요).")
         return found
     return sys.executable
 

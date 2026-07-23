@@ -16,15 +16,30 @@ import psutil
 from PySide6.QtCore import QObject, Signal
 
 _NO_WINDOW_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+# WSL2는 nvidia-smi를 /usr/lib/wsl/lib/에 심어두는데, NVIDIA 공식 문서(CUDA on WSL User Guide)
+# 스스로도 "root/일부 프로세스는 이 위치를 PATH에서 못 찾는다"고 밝히고 있다 - GUI 앱처럼
+# 로그인 셸을 안 거치고 뜨는 프로세스는 PATH가 그 경로를 안 물려받을 수 있다. shutil.which로
+# 못 찾으면 이 표준 경로를 마지막 수단으로 확인한다.
+_WSL_NVIDIA_SMI_FALLBACK = "/usr/lib/wsl/lib/nvidia-smi"
+
+
+def _find_nvidia_smi() -> str:
+    found = shutil.which("nvidia-smi")
+    if found:
+        return found
+    if os.path.exists(_WSL_NVIDIA_SMI_FALLBACK):
+        return _WSL_NVIDIA_SMI_FALLBACK
+    return ""
 
 
 def _query_gpu() -> list:
-    if shutil.which("nvidia-smi") is None:
+    nvidia_smi = _find_nvidia_smi()
+    if not nvidia_smi:
         return []
     try:
         result = subprocess.run(
             [
-                "nvidia-smi",
+                nvidia_smi,
                 "--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu,driver_version,compute_cap",
                 "--format=csv,noheader,nounits",
             ],
