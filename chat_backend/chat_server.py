@@ -99,7 +99,7 @@ def load_backend():
             if hasattr(os, "add_dll_directory") and os.path.isdir(cuda_bin):
                 os.add_dll_directory(cuda_bin)
 
-    from llama_cpp import Llama
+    from llama_cpp import Llama, LLAMA_SPLIT_MODE_LAYER, LLAMA_SPLIT_MODE_NONE
 
     n_ctx = config.get("n_ctx", 8192)
     # n_batch/n_ubatch를 늘리고 flash_attn을 켜면 프롬프트 처리(prefill) 속도가 크게 빨라진다 -
@@ -108,6 +108,13 @@ def load_backend():
     # 답변 단계에서 (원본 프롬프트 + 생각 전체)를 다시 평가해야 하므로 이 속도가 특히 중요하다.
     # VRAM은 더 쓰지만 이 모델(2.4B, Q4_K_M)은 워낙 작아 여유가 크다. gguf-cpu 백엔드는 GPU가
     # 없으므로 이 옵션들의 이득이 없지만 넣어도 해는 없다(전부 llama.cpp가 CPU에서도 지원).
+    #
+    # split_mode/main_gpu: llama.cpp의 기본값(LLAMA_SPLIT_MODE_LAYER)은 보이는 CUDA 장치가
+    # 여러 개면 레이어를 자동으로 전부 나눠 올린다 - 이 모델(2.4B)은 GPU 1개 VRAM에도 충분히
+    # 들어가는데, 이 기본값 때문에 멀티 GPU 학습용 PC(GPU 4개 등)에서 지정한 적도 없이 VRAM이
+    # 전 GPU에 조금씩 걸쳐 올라가는 문제가 있었다. 학습이 실제로 4개 GPU를 다 쓰는 상황에서는
+    # 챗봇이 전 GPU에 조금씩 걸쳐있는 것보다, GPU 0 하나에만 몰아주는 쪽이 나머지 GPU들의
+    # 학습용 VRAM 여유를 온전히 지켜준다.
     llm = Llama(
         model_path=str(model_path),
         n_gpu_layers=config.get("n_gpu_layers", -1) if backend == "gguf-cuda" else 0,
@@ -116,6 +123,8 @@ def load_backend():
         n_ubatch=2048,
         offload_kqv=True,
         flash_attn=True,
+        main_gpu=config.get("main_gpu", 0),
+        split_mode=LLAMA_SPLIT_MODE_NONE if backend == "gguf-cuda" else LLAMA_SPLIT_MODE_LAYER,
         verbose=False,
     )
     return llm, backend, n_ctx
