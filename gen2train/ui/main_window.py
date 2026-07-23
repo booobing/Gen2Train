@@ -411,6 +411,13 @@ class MainWindow(QMainWindow):
             reg_data_dir=result.reg_data_dir,
         )
 
+        # 멀티 GPU면 학습 프로세스 여러 개가 거의 동시에 뜨는데, CLIP 토크나이저를 처음 쓰는
+        # PC에서는 그 프로세스들이 전부 동시에 같은 파일을 HuggingFace 캐시로 받으려다 경쟁
+        # 상태로 캐시가 깨질 수 있다(실제로 재현됨). 띄우기 전에 미리 하나씩 받아둔다 - 이미
+        # 캐시돼 있으면 순식간에 끝난다.
+        self._append_log("[Gen2Train] 토크나이저 캐시를 확인합니다...")
+        trainer.prewarm_tokenizer_cache(self._current_model_type(), settings.load_settings()["python_path"])
+
         try:
             self._trainer.start(program, args, cwd=settings.SD_SCRIPTS_DIR)
         except trainer.TrainingError as exc:

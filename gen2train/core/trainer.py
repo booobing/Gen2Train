@@ -4,6 +4,7 @@ kohya_ss의 kohya_gui/class_command_executor.py와 kohya_gui/class_accelerate_la
 subprocess를 다루던 방식(별도 토큰으로 인자 구성, psutil로 프로세스 트리 종료)을 그대로 계승한다.
 """
 import re
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -12,6 +13,13 @@ from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
 
 from .. import settings
 from . import arg_introspect, dataset_prep, log_translate, system_info
+
+# sd-scripts/library/strategy_sdxl.py, strategy_sd.py가 실제로 쓰는 CLIP 토크나이저 - 여기에
+# 하드코딩하는 게 아니라 sd-scripts 쪽 상수와 정확히 맞춰야 한다(TOKENIZER1_PATH/TOKENIZER2_PATH).
+_TOKENIZER_MODELS = {
+    "sd": [("openai/clip-vit-large-patch14", None)],
+    "sdxl": [("openai/clip-vit-large-patch14", None), ("laion/CLIP-ViT-bigG-14-laion2B-39B-b160k", None)],
+}
 
 # train_network.py의 tqdm(desc="steps") 출력: "steps:  34%|███▍ | 170/500 [02:15<04:23, 1.25it/s, avr_loss=0.08]"
 STEP_LINE_RE = re.compile(r"steps:\s*\d+%\|.*?\|\s*(\d+)/(\d+)\s*\[")
@@ -118,6 +126,29 @@ def build_command(
         args.extend(_format_arg(spec, params[spec.dest]))
 
     return app_settings["accelerate_path"], args
+
+
+def prewarm_tokenizer_cache(model_type: str, python_path: str) -> None:
+    """멀티 GPU 학습을 시작하기 전에, CLIP 토크나이저를 미리 단일 프로세스로 캐시해둔다.
+
+    accelerate launch --multi_gpu는 학습 프로세스 여러 개를 거의 동시에 띄우는데, 이 모델을
+    처음 쓰는 PC라면 그 프로세스들이 전부 동시에 같은 CLIP 토크나이저를 HuggingFace 캐시로
+    받으려 든다 - 실제로 이 경쟁 상태 때문에 캐시가 일부 파일만 받아진 채로 남아(예:
+    tokenizer.json 누락) 학습 전체가 FileNotFoundError로 죽는 게 재현됐다. 학습 프로세스들을
+    띄우기 전에 이 함수가 먼저 하나씩 순서대로 받아둬서, 여러 랭크가 동시에 같은 파일을
+    건드리는 상황 자체를 없앤다. 이미 캐시돼 있으면(두 번째 실행부터는 항상 그렇다) 네트워크
+    요청 없이 바로 끝난다.
+    """
+    models = _TOKENIZER_MODELS.get(model_type)
+    if not models:
+        return
+    script = "from transformers import CLIPTokenizer\n" + "\n".join(
+        f"CLIPTokenizer.from_pretrained({model_id!r}, subfolder={subfolder!r})" for model_id, subfolder in models
+    )
+    try:
+        subprocess.run([python_path, "-c", script], capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError):
+        pass  # 실패해도 조용히 넘어간다 - 실제 학습 시작 시 같은 원인으로 다시 실패하면 그때 사용자에게 보인다.
 
 
 def _quote_for_log(token: str) -> str:
