@@ -21,7 +21,8 @@ BACKEND_CONFIG_PATH = CHAT_BACKEND_DIR / "backend_config.json"
 
 class ChatClient(QObject):
     ready = Signal(str)  # backend 이름 (예: "gguf-cuda")
-    token_received = Signal(str, str)  # request_id, text 조각
+    thought_received = Signal(str, str)  # request_id, 생각 과정 텍스트 조각
+    token_received = Signal(str, str)  # request_id, 최종 답변 텍스트 조각
     response_done = Signal(str)  # request_id
     error = Signal(str, str)  # request_id(치명적 오류면 빈 문자열), message
 
@@ -112,6 +113,10 @@ class ChatClient(QObject):
         if msg_type == "ready":
             self._ready = True
             self.ready.emit(obj.get("backend", ""))
+        elif msg_type == "thought":
+            self.thought_received.emit(obj.get("id", ""), obj.get("text", ""))
+        elif msg_type == "thought_done":
+            pass  # token_received가 오기 시작하면 답변 단계로 넘어간 것이므로 별도 처리 불필요
         elif msg_type == "token":
             self.token_received.emit(obj.get("id", ""), obj.get("text", ""))
         elif msg_type == "done":

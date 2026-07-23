@@ -2,6 +2,7 @@
 import uuid
 
 from PySide6.QtWidgets import (
+    QCheckBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -48,13 +49,16 @@ class ChatPanel(QWidget):
 
         self._client = ChatClient(self)
         self._client.ready.connect(self._on_ready)
+        self._client.thought_received.connect(self._on_thought)
         self._client.token_received.connect(self._on_token)
         self._client.response_done.connect(self._on_done)
         self._client.error.connect(self._on_error)
 
         self._current_request_id = None
-        self._current_answer_raw = None
-        self._history_md: list = []
+        # 진행 중인 답변 항목: {"role": "assistant", "thought": str, "answer": str, "done": bool}
+        self._current_entry = None
+        # 대화 기록. user/system 항목은 {"role", "text"}, assistant 항목은 위 형식과 동일.
+        self._history: list = []
         self._pending_request = None  # (request_id, context, question) - ready를 기다리는 중인 요청
 
         self._build_ui()
@@ -72,6 +76,17 @@ class ChatPanel(QWidget):
         self._system_status_label.setToolTip("AI 도우미가 답변할 때 참고하는 실시간 시스템 정보(하트비트)")
         layout.addWidget(self._system_status_label)
         self.update_system_status(self._get_system_snapshot())
+
+        toggle_row = QHBoxLayout()
+        self._show_thought_chk = QCheckBox("생각 과정 보기")
+        self._show_thought_chk.setToolTip(
+            "모델이 최종 답변을 만들기 전에 거친 추론 과정(생각)을 표시할지 여부.\n"
+            "기본은 숨김 - 최종 답변만 바로 보고 싶을 때 편하다."
+        )
+        self._show_thought_chk.stateChanged.connect(lambda _: self._refresh_log())
+        toggle_row.addWidget(self._show_thought_chk)
+        toggle_row.addStretch(1)
+        layout.addLayout(toggle_row)
 
         self._log = QTextBrowser()
         self._log.setOpenExternalLinks(False)
@@ -138,8 +153,9 @@ class ChatPanel(QWidget):
             return
 
         self._current_request_id = str(uuid.uuid4())
-        self._current_answer_raw = ""
         self._append_user(question)
+        self._current_entry = {"role": "assistant", "thought": "", "answer": "", "done": False}
+        self._history.append(self._current_entry)
         self._refresh_log()
         self._send_btn.setEnabled(False)
 
@@ -189,19 +205,30 @@ class ChatPanel(QWidget):
         self._system_status_label.setText(" · ".join(parts))
 
     # ------------------------------------------------------------- 응답 처리
+    #
+    # 백엔드는 답변을 두 단계로 스트리밍한다: 먼저 생각(thought) 전체를 별도 예산으로 다
+    # 모아서 보낸 뒤, 그 생각 전체를 근거로 최종 답변(token)을 새 예산으로 생성해 보낸다
+    # (chat_backend/chat_server.py의 handle_request 참고). 그래서 생각이 아무리 길어도
+    # 답변용 예산은 항상 따로 보장되어 답변이 중간에 잘리지 않는다.
+
+    def _on_thought(self, req_id: str, text: str):
+        if req_id != self._current_request_id or self._current_entry is None:
+            return
+        self._current_entry["thought"] += text
+        self._refresh_log()
 
     def _on_token(self, req_id: str, text: str):
-        if req_id != self._current_request_id or self._current_answer_raw is None:
+        if req_id != self._current_request_id or self._current_entry is None:
             return
-        self._current_answer_raw += text
+        self._current_entry["answer"] += text
         self._refresh_log()
 
     def _on_done(self, req_id: str):
         if req_id != self._current_request_id:
             return
-        if self._current_answer_raw is not None:
-            self._history_md.append(self._render_assistant_markdown(self._current_answer_raw))
-        self._current_answer_raw = None
+        if self._current_entry is not None:
+            self._current_entry["done"] = True
+        self._current_entry = None
         self._current_request_id = None
         self._send_btn.setEnabled(True)
         self._refresh_log()
@@ -210,7 +237,7 @@ class ChatPanel(QWidget):
         if req_id and req_id != self._current_request_id:
             return
         self._append_system(f"오류: {message}")
-        self._current_answer_raw = None
+        self._current_entry = None
         self._current_request_id = None
         self._send_btn.setEnabled(True)
         self._refresh_log()
@@ -219,32 +246,44 @@ class ChatPanel(QWidget):
     #
     # 모델 답변이 마크다운(###, **굵게**, 목록 등)으로 나오므로, HTML을 직접 조립하는 대신
     # 전체 대화를 마크다운 텍스트로 쌓아두고 QTextBrowser.setMarkdown()으로 그때그때
-    # 다시 렌더링한다.
+    # 다시 렌더링한다. "생각 과정 보기" 체크박스 상태에 따라 매번 다시 그려서 토글 효과를 낸다
+    # (QTextBrowser는 <details> 같은 접이식 HTML을 지원하지 않아 전체 재렌더링 방식을 쓴다).
 
     def _append_user(self, text: str):
-        self._history_md.append(f"**나:** {text}")
+        self._history.append({"role": "user", "text": text})
 
     def _append_system(self, text: str):
-        self._history_md.append(f"*[Gen2Train] {text}*")
+        self._history.append({"role": "system", "text": text})
         self._refresh_log()
 
-    def _render_assistant_markdown(self, raw_text: str, in_progress: bool = False) -> str:
-        label = "**AI 도우미 (입력 중...)**" if in_progress else "**AI 도우미**"
-        if "</thought>" in raw_text:
-            thought, final = raw_text.split("</thought>", 1)
-            thought = thought.replace("<thought>", "").strip()
-            final = final.strip()
-            return f"{label}\n\n*생각 과정*\n\n{_blockquote(thought)}\n\n{final if final else '...'}"
-        if "<thought>" in raw_text:
-            thought = raw_text.replace("<thought>", "").strip()
-            return f"{label}\n\n*(생각 중)*\n\n{_blockquote(thought)}"
-        return f"{label}\n\n{raw_text if raw_text else '...'}"
+    def _render_assistant_entry(self, entry: dict) -> str:
+        label = "**AI 도우미**" if entry["done"] else "**AI 도우미 (입력 중...)**"
+        show_thought = self._show_thought_chk.isChecked()
+        thought = entry["thought"].strip()
+        answer = entry["answer"].strip()
+
+        parts = [label]
+        if show_thought and thought:
+            parts.append(f"*생각 과정*\n\n{_blockquote(thought)}")
+        if answer:
+            parts.append(answer)
+        elif thought and not show_thought:
+            parts.append("*(생각 중입니다 - '생각 과정 보기'를 체크하면 볼 수 있습니다)*")
+        elif not thought:
+            parts.append("...")
+        return "\n\n".join(parts)
 
     def _refresh_log(self):
-        parts = list(self._history_md)
-        if self._current_answer_raw is not None:
-            parts.append(self._render_assistant_markdown(self._current_answer_raw, in_progress=True))
-        self._log.setMarkdown("\n\n---\n\n".join(parts))
+        rendered = []
+        for entry in self._history:
+            role = entry["role"]
+            if role == "user":
+                rendered.append(f"**나:** {entry['text']}")
+            elif role == "system":
+                rendered.append(f"*[Gen2Train] {entry['text']}*")
+            else:
+                rendered.append(self._render_assistant_entry(entry))
+        self._log.setMarkdown("\n\n---\n\n".join(rendered))
         scrollbar = self._log.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
