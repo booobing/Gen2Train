@@ -18,6 +18,15 @@ DEFAULT_SETTINGS = {
     "python_path": sys.executable,
     "accelerate_path": None,  # None이면 python_path와 같은 Scripts 폴더의 accelerate(.exe)를 사용
     "num_cpu_threads_per_process": 2,
+    # 멀티 GPU: "auto"면 nvidia-smi로 감지된 GPU가 2개 이상일 때 전부 자동으로 사용한다
+    # (trainer.py의 _resolve_multi_gpu_args 참고). GPU 개수를 여기 하드코딩하지 않는다.
+    "multi_gpu": "auto",  # "auto" | true | false
+    "gpu_ids": "",  # 비워두면 auto 감지 결과를 그대로 쓴다. 예: "0,1" -> 0,1번 GPU만 사용
+    "num_machines": 1,
+    # WSL2에서 멀티 GPU 학습 시 NCCL P2P/SHM을 꺼야 CUDA error 999를 피할 수 있다(trainer.py의
+    # system_info.is_wsl() 감지 시에만 적용, 순수 Windows에는 영향 없음). SHM을 끈 채로도
+    # 문제가 재발하면 이 값을 true로 바꿔 NCCL_SHM_DISABLE=1까지 추가로 켠다(속도는 손해).
+    "nccl_shm_disable": False,
 }
 
 

@@ -11,7 +11,7 @@ import psutil
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
 
 from .. import settings
-from . import arg_introspect, dataset_prep, log_translate
+from . import arg_introspect, dataset_prep, log_translate, system_info
 
 # train_network.py의 tqdm(desc="steps") 출력: "steps:  34%|███▍ | 170/500 [02:15<04:23, 1.25it/s, avr_loss=0.08]"
 STEP_LINE_RE = re.compile(r"steps:\s*\d+%\|.*?\|\s*(\d+)/(\d+)\s*\[")
@@ -32,6 +32,43 @@ def _format_arg(spec: arg_introspect.ArgSpec, value) -> list[str]:
         parts = str(value).split()
         return [spec.flag, *parts] if parts else []
     return [spec.flag, str(value)]
+
+
+def _resolve_multi_gpu_args(app_settings: dict) -> list[str]:
+    """accelerate launch에 붙일 멀티 GPU 관련 인자를 결정한다.
+
+    GPU 개수/번호를 하드코딩하지 않고 nvidia-smi로 그때그때 감지한다(system_info.
+    detect_gpu_count) - 다른 PC로 옮기거나 GPU 구성이 바뀌어도 그대로 동작하도록. sd-scripts의
+    accelerator 초기화(train_util.py의 prepare_accelerator)는 이미 Windows에서 nccl 대신
+    gloo 백엔드를 자동으로 골라 쓰고, 배치 크기/러닝레이트도 accelerator.num_processes에 맞춰
+    스스로 조정하므로, 여기서는 accelerate launch 쪽에 몇 개의 프로세스로 어떤 GPU를 쓸지만
+    알려주면 된다.
+    """
+    gpu_ids = str(app_settings.get("gpu_ids") or "").strip()
+    multi_gpu_setting = app_settings.get("multi_gpu", "auto")
+
+    if gpu_ids:
+        ids = [i.strip() for i in gpu_ids.split(",") if i.strip()]
+    elif multi_gpu_setting in (False, "false", "off", 0):
+        return []
+    else:
+        gpu_count = system_info.detect_gpu_count()
+        if gpu_count <= 1:
+            return []
+        ids = [str(i) for i in range(gpu_count)]
+
+    if len(ids) <= 1:
+        return []
+
+    return [
+        "--multi_gpu",
+        "--num_processes",
+        str(len(ids)),
+        "--num_machines",
+        str(app_settings.get("num_machines", 1)),
+        "--gpu_ids",
+        ",".join(ids),
+    ]
 
 
 def build_command(
@@ -57,6 +94,7 @@ def build_command(
         str(num_cpu_threads),
         "--mixed_precision",
         str(mixed_precision),
+        *_resolve_multi_gpu_args(app_settings),
         str(script_path),
         "--pretrained_model_name_or_path",
         str(pretrained_model_path),
@@ -131,6 +169,26 @@ class TrainerProcess(QObject):
         # 폭을 넉넉히 줘서 각 메시지가 한 줄에 온전히 나오게 한다.
         env.insert("COLUMNS", "300")
         env.insert("LINES", "50")
+
+        if system_info.is_wsl():
+            # WSL2는 cuMem API와 GPU 간 CUDA IPC(P2P)를 지원하지 않아, NCCL이 기본값 그대로
+            # 이 기능들을 쓰려다 CUDA error 999로 죽는다. import 시점이 아니라 여기서(자식
+            # 프로세스를 실제로 띄우기 직전) 환경변수로 넣어야 accelerate launch가 스폰하는
+            # 모든 DDP 워커 프로세스가 그대로 상속받는다.
+            env.insert("NCCL_CUMEM_ENABLE", "0")
+            env.insert("NCCL_P2P_DISABLE", "1")
+            env.insert("NCCL_IB_DISABLE", "1")
+            env.insert("USE_LIBUV", "0")
+            # 셸/부모 프로세스에 남아있으면 SHM 경로가 막혀 all-reduce가 TCP로 떨어질 수
+            # 있으므로 방어적으로 제거한다. 그래도 CUDA error 999가 재발하면 settings.local.json의
+            # nccl_shm_disable을 true로 바꿔 NCCL_SHM_DISABLE=1을 켠다(속도는 손해지만 동작은 함).
+            app_settings = settings.load_settings()
+            if app_settings.get("nccl_shm_disable"):
+                env.insert("NCCL_SHM_DISABLE", "1")
+            else:
+                env.remove("NCCL_SHM_DISABLE")
+            env.remove("NCCL_SOCKET_IFNAME")
+
         process.setProcessEnvironment(env)
 
         if cwd is not None:
