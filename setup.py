@@ -108,21 +108,28 @@ def package_importable(py: str, module: str) -> bool:
 
 
 def install_torch(py: str) -> None:
-    if package_importable(py, "torch"):
-        log("torch가 이미 설치되어 있습니다.")
+    # torch뿐 아니라 torchvision도 확인한다 - sd-scripts/library/utils.py와 train_util.py가
+    # torchvision을 직접 임포트하는데, torch만 있고 torchvision이 없는 상태(예: 이전 실행이
+    # 중간에 실패한 경우)에서도 "이미 설치됨"으로 잘못 판단해 건너뛰지 않도록 한다.
+    if package_importable(py, "torch") and package_importable(py, "torchvision"):
+        log("torch/torchvision이 이미 설치되어 있습니다.")
         return
 
     run([py, "-m", "pip", "install", "-q", "-U", "pip"], check=False)
 
+    # torch와 torchvision은 반드시 같은 pip 호출로 함께 설치해야 서로 호환되는 버전 조합을
+    # pip이 알아서 골라준다 (공식 PyTorch 설치 안내와 동일한 방식) - 따로따로 설치하면
+    # 버전이 어긋나 임포트 시점에야 문제가 드러날 수 있다.
     cuda_path = find_cuda_path()
     if cuda_path:
         match = re.search(r"v(\d+)\.(\d+)", Path(cuda_path).name)
         major = int(match.group(1)) if match else None
         tags = KNOWN_TORCH_CUDA_TAGS.get(major, [])
         for tag in tags:
-            log(f"CUDA 툴킷 발견({cuda_path}). PyTorch({tag}) 설치를 시도합니다...")
+            log(f"CUDA 툴킷 발견({cuda_path}). PyTorch/torchvision({tag}) 설치를 시도합니다...")
             result = run(
-                [py, "-m", "pip", "install", "torch", "--index-url", f"https://download.pytorch.org/whl/{tag}"],
+                [py, "-m", "pip", "install", "torch", "torchvision",
+                 "--index-url", f"https://download.pytorch.org/whl/{tag}"],
                 check=False,
             )
             if result.returncode == 0:
@@ -131,7 +138,7 @@ def install_torch(py: str) -> None:
     else:
         log("CUDA 툴킷을 찾지 못했습니다. CPU 전용 PyTorch를 설치합니다 (느리지만 항상 동작함)...")
 
-    run([py, "-m", "pip", "install", "torch"], check=True)
+    run([py, "-m", "pip", "install", "torch", "torchvision"], check=True)
 
 
 def install_requirements(py: str) -> None:

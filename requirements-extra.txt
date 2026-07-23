@@ -6,3 +6,14 @@
 # requirements.txt, torch를 전부 설치해 이 프로젝트 전용 venv를 새로 만든다.
 PySide6>=6.11.0
 psutil>=5.9.0
+
+# sd-scripts/library가 실제로 임포트하지만 sd-scripts/requirements.txt에는 없는 것들
+# (지금까지는 accelerate/diffusers/transformers 등을 통해 간접적으로만 깔려 있었다 -
+# 여기서 명시해 상위 패키지들이 나중에 이 의존성을 빼도 깨지지 않게 한다).
+Pillow
+packaging
+tqdm
+
+# DAdaptAdam은 기본 설정 탭(basic_panel.py)의 옵티마이저 선택지에 실제로 들어있다 -
+# 사용자가 그걸 고르면 sd-scripts/library/train_util.py가 이 패키지를 임포트한다.
+dadaptation

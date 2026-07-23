@@ -24,7 +24,7 @@ REM Check whether required packages are actually importable. Results are passed 
 REM temp file rather than a for/f capture (see CheckVenvPython below for why).
 set "PKG_CHECK="
 set "PKG_CHECK_FILE=%TEMP%\_g2t_pkg_check_%RANDOM%.txt"
-"%PYTHON_EXE%" %PYTHON_ARGS% -c "import PySide6, torch, accelerate; print(1)" >"%PKG_CHECK_FILE%" 2>nul
+"%PYTHON_EXE%" %PYTHON_ARGS% -c "import PySide6, torch, torchvision, accelerate; print(1)" >"%PKG_CHECK_FILE%" 2>nul
 if exist "%PKG_CHECK_FILE%" set /p PKG_CHECK=<"%PKG_CHECK_FILE%"
 del "%PKG_CHECK_FILE%" >nul 2>&1
 

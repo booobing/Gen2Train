@@ -6,7 +6,9 @@ models/
 venv_chat/
 *.pyc
 gen2train/core/__pycache__/
+gen2train/ui/__pycache__/
 gen2train/__pycache__/
+gen2train/__pycache__
 __pycache__/
 venv
 venv/
