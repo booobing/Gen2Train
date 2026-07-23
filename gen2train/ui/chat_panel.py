@@ -1,6 +1,7 @@
 """로컬 LLM(EXAONE-Deep, chat_backend/) 기반 파라미터 추천/QA 채팅 패널."""
 import uuid
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QCheckBox,
     QHBoxLayout,
@@ -60,6 +61,17 @@ class ChatPanel(QWidget):
         # 대화 기록. user/system 항목은 {"role", "text"}, assistant 항목은 위 형식과 동일.
         self._history: list = []
         self._pending_request = None  # (request_id, context, question) - ready를 기다리는 중인 요청
+
+        # 토큰마다 QTextBrowser 전체를 마크다운으로 다시 그리면(setMarkdown) GUI 스레드가
+        # 초당 수십 번씩 바빠져서, 생성 중에 입력창에 한글을 IME로 입력할 때 조합이 끊기는
+        # 문제가 있었다(WSL2/WSLg에서 특히 체감됨 - IME 조합 렌더링은 이벤트 루프가 제때
+        # 돌아야 한다). 토큰이 올 때마다 즉시 다시 그리는 대신, 짧은 간격으로 묶어서(최대
+        # 초당 ~12회) 그린다 - 스트리밍이 눈에 덜컥거리지 않으면서도 GUI 스레드 부하를 크게
+        # 줄인다.
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(80)
+        self._refresh_timer.timeout.connect(self._refresh_log)
 
         self._build_ui()
 
@@ -215,13 +227,13 @@ class ChatPanel(QWidget):
         if req_id != self._current_request_id or self._current_entry is None:
             return
         self._current_entry["thought"] += text
-        self._refresh_log()
+        self._schedule_refresh()
 
     def _on_token(self, req_id: str, text: str):
         if req_id != self._current_request_id or self._current_entry is None:
             return
         self._current_entry["answer"] += text
-        self._refresh_log()
+        self._schedule_refresh()
 
     def _on_done(self, req_id: str):
         if req_id != self._current_request_id:
@@ -231,6 +243,7 @@ class ChatPanel(QWidget):
         self._current_entry = None
         self._current_request_id = None
         self._send_btn.setEnabled(True)
+        self._refresh_timer.stop()
         self._refresh_log()
 
     def _on_error(self, req_id: str, message: str):
@@ -240,6 +253,7 @@ class ChatPanel(QWidget):
         self._current_entry = None
         self._current_request_id = None
         self._send_btn.setEnabled(True)
+        self._refresh_timer.stop()
         self._refresh_log()
 
     # ------------------------------------------------------------- 화면 표시
@@ -272,6 +286,10 @@ class ChatPanel(QWidget):
         elif not thought:
             parts.append("...")
         return "\n\n".join(parts)
+
+    def _schedule_refresh(self):
+        if not self._refresh_timer.isActive():
+            self._refresh_timer.start()
 
     def _refresh_log(self):
         rendered = []
