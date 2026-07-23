@@ -5,6 +5,7 @@ trainer.py의 TrainerProcess와 같은 QProcess 패턴을 쓰지만, 1회성 학
 stdin/stdout으로 JSON Lines 프로토콜을 주고받는다 (chat_backend/chat_server.py 참고).
 """
 import json
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -14,7 +15,13 @@ from PySide6.QtCore import QObject, QProcess, Signal
 from .. import settings
 
 CHAT_BACKEND_DIR = settings.BASE_DIR / "chat_backend"
-CHAT_VENV_PYTHON = settings.BASE_DIR / "venv_chat" / "Scripts" / "python.exe"
+_CHAT_VENV_DIR = settings.BASE_DIR / "venv_chat"
+# venv_chat은 chat_backend/setup_chat_model.py가 만드는데, 그 스크립트도 OS에 따라
+# Scripts/python.exe(Windows) 또는 bin/python(Linux/WSL2)에 만든다 - 여기서 같은 규칙을
+# 따라야 한다.
+CHAT_VENV_PYTHON = (
+    _CHAT_VENV_DIR / "Scripts" / "python.exe" if os.name == "nt" else _CHAT_VENV_DIR / "bin" / "python"
+)
 CHAT_SERVER_SCRIPT = CHAT_BACKEND_DIR / "chat_server.py"
 BACKEND_CONFIG_PATH = CHAT_BACKEND_DIR / "backend_config.json"
 

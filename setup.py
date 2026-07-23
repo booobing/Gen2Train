@@ -6,17 +6,23 @@ torch/accelerate/transformers/diffusers 등 학습에 필요한 패키지와 PyS
 pyvenv.cfg가 그 PC의 경로를 가리키는 경우) 이 프로젝트 전용 venv(Gen2Train\\venv)를 새로
 만든다. 어떤 PC에서 실행해도 동작하도록 Python/CUDA 위치를 하드코딩하지 않고 그때그때 탐색한다.
 
-사용법: Gen2Train\\setup.bat 을 더블클릭하거나, 이 파일을 아무 python으로나 실행.
-run.bat은 필요한 패키지가 없으면 이 스크립트를 자동으로 실행한다.
+사용법: Windows는 setup.bat, Linux/WSL2는 setup.sh를 실행하거나, 이 파일을 아무
+python으로나 직접 실행. run.bat/run.sh는 필요한 패키지가 없으면 이 스크립트를 자동으로
+실행한다.
 """
+import os
 import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+IS_WINDOWS = os.name == "nt"
+
 BASE_DIR = Path(__file__).resolve().parent
 VENV_DIR = BASE_DIR / "venv"
+# kohya_ss 공유 venv는 Windows용 venv라 Linux/WSL2에서는 재사용할 수 없다 - 그쪽은 항상 이
+# 프로젝트 전용 venv(VENV_DIR)를 새로 만든다 (ensure_venv 참고).
 SHARED_VENV_DIR = BASE_DIR.parent / "kohya_ss" / "kohya_ss" / "venv"
 SD_SCRIPTS_REQUIREMENTS = BASE_DIR / "sd-scripts" / "requirements.txt"
 EXTRA_REQUIREMENTS = BASE_DIR / "requirements-extra.txt"
@@ -47,18 +53,24 @@ def run(cmd, **kwargs) -> subprocess.CompletedProcess:
 
 def find_system_python() -> str:
     """venv를 새로 만들 때 쓸 시스템 Python을 찾는다. 특정 사용자/설치 경로를 가정하지 않는다."""
-    for py_args in (["py", "-3.11"], ["py", "-3"]):
-        try:
-            result = subprocess.run(
-                py_args + ["-c", "import sys; print(sys.executable)"],
-                capture_output=True, text=True, timeout=10,
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if result.returncode == 0:
-            path = result.stdout.strip()
-            if path and Path(path).exists():
-                return path
+    if IS_WINDOWS:
+        for py_args in (["py", "-3.11"], ["py", "-3"]):
+            try:
+                result = subprocess.run(
+                    py_args + ["-c", "import sys; print(sys.executable)"],
+                    capture_output=True, text=True, timeout=10,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if result.returncode == 0:
+                path = result.stdout.strip()
+                if path and Path(path).exists():
+                    return path
+    else:
+        for candidate in ("python3.11", "python3"):
+            found = shutil.which(candidate)
+            if found:
+                return found
     found = shutil.which("python") or shutil.which("python3")
     if found:
         return found
@@ -68,7 +80,10 @@ def find_system_python() -> str:
 def shared_venv_python() -> str:
     """kohya_ss 공유 venv의 python.exe 경로. 파일 존재만이 아니라 실제로 동작하는지까지
     확인한다 - 다른 PC에서 복사된 venv는 pyvenv.cfg가 원래 PC의 경로를 가리켜 깨져 있을
-    수 있다(run.bat과 동일한 이유)."""
+    수 있다(run.bat과 동일한 이유). 이 공유 venv 자체가 Windows용이라 Linux/WSL2에서는
+    애초에 시도하지 않는다."""
+    if not IS_WINDOWS:
+        return ""
     candidate = SHARED_VENV_DIR / "Scripts" / "python.exe"
     if not candidate.exists():
         return ""
@@ -82,7 +97,9 @@ def shared_venv_python() -> str:
 
 
 def venv_python() -> Path:
-    return VENV_DIR / "Scripts" / "python.exe"
+    if IS_WINDOWS:
+        return VENV_DIR / "Scripts" / "python.exe"
+    return VENV_DIR / "bin" / "python"
 
 
 def ensure_venv() -> str:

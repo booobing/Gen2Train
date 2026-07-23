@@ -1,4 +1,5 @@
-"""Gen2Train 진입점. run.bat이 kohya_ss 공유 venv의 python으로 이 파일을 실행한다."""
+"""Gen2Train 진입점. Windows는 run.bat, Linux/WSL2는 run.sh가 적절한 venv의 python으로
+이 파일을 실행한다."""
 import sys
 from pathlib import Path
 

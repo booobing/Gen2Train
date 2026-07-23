@@ -14,9 +14,10 @@ PRESETS_DIR = BASE_DIR / "presets"
 SETTINGS_FILE = BASE_DIR / "gen2train" / "settings.local.json"
 
 DEFAULT_SETTINGS = {
-    # run.bat이 공유 venv의 python.exe로 앱을 띄우므로 기본값은 sys.executable을 그대로 쓰면 된다.
+    # run.bat/run.sh가 적절한 venv의 python으로 앱을 띄우므로 기본값은 sys.executable을 그대로
+    # 쓰면 된다(Windows는 python.exe, Linux/WSL2는 python).
     "python_path": sys.executable,
-    "accelerate_path": None,  # None이면 python_path와 같은 Scripts 폴더의 accelerate(.exe)를 사용
+    "accelerate_path": None,  # None이면 python_path와 같은 폴더(Windows: Scripts, Linux: bin)의 accelerate를 사용
     "num_cpu_threads_per_process": 2,
     # 멀티 GPU: "auto"면 nvidia-smi로 감지된 GPU가 2개 이상일 때 전부 자동으로 사용한다
     # (trainer.py의 _resolve_multi_gpu_args 참고). GPU 개수를 여기 하드코딩하지 않는다.
