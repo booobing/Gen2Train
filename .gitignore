@@ -12,3 +12,4 @@ gen2train/__pycache__
 __pycache__/
 venv
 venv/
+presets/_last_used.json
