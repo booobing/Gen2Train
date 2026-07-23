@@ -42,6 +42,13 @@ KNOWN_TORCH_CUDA_TAGS = {
 }
 
 
+# sd-scripts(kohya_ss)의 requirements.txt는 pytorch-lightning==1.9.0/bitsandbytes==0.44.0처럼
+# 몇 년 된 버전을 그대로 고정하고 있어, 너무 최신인 Python(3.13+)에서는 그 버전들의 prebuilt
+# wheel이 아예 없어 소스 빌드로 새다가 실패하기 쉽다(numpy<=2.0도 마찬가지). Windows 쪽
+# 기본값도 3.11이므로 이 범위를 "검증된" 버전으로 취급한다.
+SUPPORTED_PY_VERSIONS = {(3, 10), (3, 11)}
+
+
 def log(msg: str) -> None:
     print(f"[setup] {msg}", flush=True)
 
@@ -49,6 +56,23 @@ def log(msg: str) -> None:
 def run(cmd, **kwargs) -> subprocess.CompletedProcess:
     log("실행: " + " ".join(str(c) for c in cmd))
     return subprocess.run(cmd, **kwargs)
+
+
+def _python_version(path: str) -> tuple | None:
+    try:
+        result = subprocess.run(
+            [path, "-c", "import sys; print(sys.version_info[0], sys.version_info[1])"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        major, minor = result.stdout.split()
+        return (int(major), int(minor))
+    except ValueError:
+        return None
 
 
 def find_system_python() -> str:
@@ -67,12 +91,33 @@ def find_system_python() -> str:
                 if path and Path(path).exists():
                     return path
     else:
-        for candidate in ("python3.11", "python3"):
+        for candidate in ("python3.11", "python3.10"):
             found = shutil.which(candidate)
             if found:
                 return found
+
+    # 여기까지 왔으면 정확히 3.10/3.11로 이름 붙은 인터프리터를 못 찾은 것이다. PATH의
+    # python3/python으로 그럭저럭 넘어갈 수는 있지만(예: conda base 환경의 python3가 3.14인
+    # 경우), sd-scripts의 오래된 고정 버전 패키지들이 빌드 실패할 가능성이 높으므로 그냥
+    # 조용히 쓰지 않고 미리 경고한다.
     found = shutil.which("python") or shutil.which("python3")
     if found:
+        version = _python_version(found)
+        if version is not None and version not in SUPPORTED_PY_VERSIONS:
+            log(f"경고: 시스템에서 찾은 Python이 {version[0]}.{version[1]}입니다 (검증된 버전: 3.10/3.11).")
+            log(
+                "sd-scripts가 고정한 오래된 패키지 버전들(numpy<=2.0, pytorch-lightning==1.9.0 등)은 "
+                "이보다 새 Python에서 미리 빌드된 wheel이 없어 소스 빌드가 필요할 수 있고, 컴파일러가 "
+                "없으면 그 자리에서 실패합니다."
+            )
+            if not IS_WINDOWS:
+                log(
+                    "Ubuntu/WSL2라면 Python 3.11을 설치한 뒤 다시 실행해주세요: "
+                    "sudo apt update && sudo apt install -y python3.11 python3.11-venv "
+                    "(패키지가 없으면: sudo add-apt-repository ppa:deadsnakes/ppa && sudo apt update "
+                    "&& sudo apt install -y python3.11 python3.11-venv)"
+                )
+            log("일단 이 Python으로 계속 진행합니다...")
         return found
     return sys.executable
 
@@ -109,8 +154,19 @@ def ensure_venv() -> str:
         return shared
 
     if venv_python().exists():
-        log(f"기존 venv를 재사용합니다: {VENV_DIR}")
-        return str(venv_python())
+        version = _python_version(str(venv_python()))
+        if version is not None and version not in SUPPORTED_PY_VERSIONS:
+            # 예전에 이 venv를 만들 때 검증되지 않은 Python(예: conda base의 3.14)이 잡혀서
+            # 만들어진 경우. 그대로 재사용하면 numpy 등 오래된 고정 버전 패키지가 계속
+            # 소스 빌드로 새다 실패하므로, 조용히 재사용하지 않고 지우고 새로 만든다.
+            log(
+                f"기존 venv({VENV_DIR})가 검증되지 않은 Python {version[0]}.{version[1]}로 "
+                "만들어져 있습니다. 삭제하고 다시 만듭니다..."
+            )
+            shutil.rmtree(VENV_DIR)
+        else:
+            log(f"기존 venv를 재사용합니다: {VENV_DIR}")
+            return str(venv_python())
 
     log("kohya_ss 공유 venv가 없거나 동작하지 않아 이 프로젝트 전용 venv를 새로 만듭니다...")
     py = find_system_python()
@@ -159,6 +215,14 @@ def install_torch(py: str) -> None:
 
 
 def install_requirements(py: str) -> None:
+    if not IS_WINDOWS and not (shutil.which("cc") or shutil.which("gcc") or shutil.which("g++")):
+        # sd-scripts requirements의 일부(numpy, safetensors, schedulefree 등)는 prebuilt
+        # wheel이 없는 Python 버전/플랫폼 조합이면 소스를 직접 컴파일하려 든다. 컴파일러가
+        # 없으면 몇 GB를 내려받은 뒤에야(torch 설치 이후) 실패하게 되므로, 여기서 미리
+        # 확인해 바로 안내한다.
+        log("경고: C 컴파일러(gcc/g++)를 찾지 못했습니다. 일부 패키지는 소스 빌드가 필요할 수 있습니다.")
+        log("Ubuntu/WSL2라면 다음을 먼저 실행해주세요: sudo apt update && sudo apt install -y build-essential")
+
     if SD_SCRIPTS_REQUIREMENTS.exists():
         log("학습 관련 패키지(accelerate, transformers, diffusers 등)를 설치합니다...")
         # sd-scripts/requirements.txt의 마지막 줄("-e .")은 sd-scripts 자신을 editable
