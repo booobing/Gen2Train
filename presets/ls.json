@@ -16,7 +16,7 @@
   },
   "params": {
     "resolution": "512,512",
-    "train_batch_size": 32,
+    "train_batch_size": 4,
     "gradient_accumulation_steps": 16,
     "max_train_epochs": 10,
     "learning_rate": 1.0,
