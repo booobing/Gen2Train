@@ -1,5 +1,8 @@
 """Gen2Train 메인 윈도우: 폴더/모델 지정, 파라미터 탭, 로그, 학습 시작/중지."""
 import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -486,7 +489,18 @@ class MainWindow(QMainWindow):
     def _on_open_output(self):
         path = self._run_output_dir()
         path.mkdir(parents=True, exist_ok=True)
-        os.startfile(str(path))  # noqa: S606 - Windows 전용 앱
+        # os.startfile은 Windows 전용이라 Linux/WSL2에서는 AttributeError로 죽는다(실제로
+        # 재현됨). macOS는 open, Linux는 xdg-open(데스크톱 환경/파일 관리자가 있을 때만
+        # 동작 - WSL2는 최소 설치라 없을 수 있다)을 쓰고, 그마저 없으면 폴더 경로를 메시지로
+        # 보여줘서 최소한 죽지는 않게 한다.
+        if os.name == "nt":
+            os.startfile(str(path))  # noqa: S606 - Windows 전용 API
+        elif sys.platform == "darwin":
+            subprocess.run(["open", str(path)], check=False)
+        elif shutil.which("xdg-open"):
+            subprocess.run(["xdg-open", str(path)], check=False)
+        else:
+            QMessageBox.information(self, "Gen2Train", f"출력 폴더: {path}")
 
     # ----------------------------------------------------------- presets
 
